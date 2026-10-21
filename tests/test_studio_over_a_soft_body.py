@@ -18,13 +18,24 @@ from __future__ import annotations
 
 import unittest
 
-from robosimstudio.domains.cloth import ClothMaterialSpec
-
 from robosimstudio.specs import ArrangementSpec, backend
+from robosimstudio_materials.cloth import ClothMaterialSpec
 from tests.fixtures.viser_stubs import _StubGui
 
 TIER = "fast"
 """No GPU and no scene: stub deformables against the viser stubs."""
+
+
+def _offer_material(entity, env) -> None:
+    """Give a stub deformable what ``EntityCloth.tunables`` offers: its material, written by ``LiveMaterial``."""
+    from robosimstudio.core.tuning import Tunable
+    from robosimstudio.scene.tuning import LiveMaterial, locate_cloth
+
+    def tunables(pipeline=None):
+        live = LiveMaterial(env.model, locate_cloth(env.model, entity), pipeline)
+        return (Tunable(name="material", spec=entity.spec.material, write=live.write_field, inert=live.inert()),)
+
+    entity.tunables = tunables
 
 
 class TestADeformableThatIsNotCloth(unittest.TestCase):
@@ -65,12 +76,13 @@ class TestADeformableThatIsNotCloth(unittest.TestCase):
                 physics=ArrangementSpec(control_hz=60.0, substeps=10, backends=(("*", backend("mujoco")),))
             ),
         )
+        _offer_material(entity, env)
         panel, gui = PanelTune(SimpleNamespace(env=env)), _StubGui()
         panel.build(gui)
         return panel, gui
 
     def _sponge(self):
-        from robosimstudio.domains.soft import SoftMaterialSpec
+        from robosimstudio_materials.soft import SoftMaterialSpec
 
         return self._panel(SoftMaterialSpec())
 
@@ -182,6 +194,7 @@ class TestTheTuningPageOverASceneWithNoTask(unittest.TestCase):
                 physics=ArrangementSpec(control_hz=60.0, substeps=10, backends=(("*", backend("mujoco")),)),
             ),
         )
+        _offer_material(entity, env)
         session = SimpleNamespace(env=env, status="", load_request=None, episode_id=0, num_worlds=1)
         panel, gui = PanelTune(session), _StubGui()
         panel.build(gui)

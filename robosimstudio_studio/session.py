@@ -1003,7 +1003,9 @@ class StudioSession:
         if self._wants("object") and (env.handles.objects or self.arms):
             self.objects = PanelObject(self, handles=config.handles, chrome=self.chrome)
             panels.append(self.objects)
-        if self._wants("cloth") and any(e.carries_particles for e in env.scene.by_name.values()):
+        # The things carrying a particle probe, not every particle carrier: a cuttable's eight
+        # corners are a drawing its cage solver writes, and the panels below observe, pin and settle.
+        if self._wants("cloth") and env.deformables():
             self.deformables = PanelCloth(self, handles=config.handles, chrome=self.chrome)
             panels.append(self.deformables)
             # Tuning lives beside the task rather than on a page of its own: a
@@ -1013,7 +1015,8 @@ class StudioSession:
             # The *material* folder stays for what the inspector's generated one
             # cannot do -- presets, save, revert, and `Apply & rebuild` for the
             # fields no live write can reach. Per-field tuning of the selected
-            # cloth is the inspector's now, from the same binder.
+            # cloth is the inspector's now, from the same binder, and its edits go
+            # through this folder's tuner, so a rebuild and Revert see them.
             self.tune = PanelTune(self, material_dir=config.material_dir)
             self.readings = PanelReadings(self)
             panels += [self.tune, self.readings]
@@ -1163,7 +1166,11 @@ class StudioSession:
                 self.scenery_request = True
 
             scenery.on_update(_scenery)
-            if any(e.carries_particles for e in self.env.scene.by_name.values()):
+            # Only over a sheet, the one thing a garment style changes the draw of: a rope's tube and a
+            # particle body's points or surface are drawn alike in every style. Gated on the things
+            # carrying a particle probe, a SuperDex rope's page and an MPM liquid's offered a look that
+            # changed nothing; a cuttable's eight corners are points too.
+            if self.viewer.has_sheets:
                 look = gui.add_dropdown("Cloth look", options=GARMENT_STYLES, initial_value=self.viewer.garment_style)
                 look.on_update(lambda _: setattr(self, "cloth_look_request", str(look.value)))
             # Built here rather than in ``panels``: it writes only to the viser

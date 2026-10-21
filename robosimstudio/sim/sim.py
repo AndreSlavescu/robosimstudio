@@ -42,7 +42,7 @@ from robosimstudio.solvers.render import backend_class as _backend_class
 from robosimstudio.solvers.render import create_renderer
 from robosimstudio.specs import ActionSpec, CameraSpec, replace
 
-__all__ = ["Sim"]
+__all__ = ["Sim", "scene_deformables"]
 
 
 class Sim(EnvBase):
@@ -483,11 +483,19 @@ class Sim(EnvBase):
         }
 
     def _deformable_colors(self) -> dict[str, tuple[float, float, float]]:
-        """``deformable name -> display RGB``, off each spec's own ``color``."""
+        """``deformable name -> display RGB``, off each spec's own ``color``, else its material's.
+
+        A particle body's spec says ``color=None`` for "the material's" (rice is
+        rice-coloured unless the scene says otherwise), so the entity's resolved
+        material is the second place to look; a body with neither is left out
+        and the renderer's default applies.
+        """
         out: dict[str, tuple[float, float, float]] = {}
         for name in self.scene.handles.deformables:
             entity = self.scene.by_name.get(name)
             color = getattr(getattr(entity, "spec", None), "color", None)
+            if color is None:
+                color = getattr(getattr(entity, "material", None), "color", None)
             if color is not None:
                 out[name] = tuple(float(v) for v in color)
         return out
@@ -663,6 +671,7 @@ class Sim(EnvBase):
         """
         import newton
 
+        self._refuse_layout(self.episode)
         if self._start_joint_q is not None:
             self.pipeline.state_0.joint_q.assign(self._start_joint_q)
             self.pipeline.state_1.joint_q.assign(self._start_joint_q)
@@ -684,8 +693,12 @@ class Sim(EnvBase):
             entity.reset(self.pipeline, self.episode)
         state = self.pipeline.state_0
         # A deformable-only scene has no rigid state to restore; the entities'
-        # own reset above is the whole of it.
-        if not self.model.body_count:
+        # own reset above is the whole of it. Nor has one whose bodies have no
+        # joint -- a static box (``add_link``) beside a sheet, no robot -- whose
+        # ``joint_qd`` is ``None``: what follows restores joint coordinates and
+        # the bodies they move, which a jointless body is not in a scene with a
+        # robot either (``c5b_drape.py``).
+        if not self.model.body_count or not self.model.joint_count:
             self.pipeline.mark_dirty()
             return
         # After the entities, which have just re-placed every object for this
@@ -706,6 +719,25 @@ class Sim(EnvBase):
         wp.copy(self.pipeline.state_1.joint_q, state.joint_q)
         self.pipeline.mark_dirty()
 
+    def _refuse_layout(self, episode, scene=None) -> None:
+        """Refuse ``episode`` if it stands a static object anywhere but where this model holds it.
+
+        Every entity is asked (:meth:`~robosimstudio.domains.rigid.entity.EntityRigid.move_refusal`)
+        before anything moves. :meth:`reset_scene` placed entity by entity and a static object's own
+        reset refused only when its turn came, so a free cube declared before a static block had gone
+        to the refused episode's x = 0.70 when the block said no (``e3_partial_reset.py``).
+        ``Env.reset`` asks this too, before it takes the episode up, of the new ``scene`` it built
+        for the episode when that needs another model (this one's when omitted).
+
+        Raises:
+            ValueError: The first object the layout moves, where, and the way out.
+        """
+        for entity in (self.scene if scene is None else scene).entities:
+            ask = getattr(entity, "move_refusal", None)
+            refusal = ask(episode) if callable(ask) else ""
+            if refusal:
+                raise ValueError(f"{refusal}. {entity.move_remedy}")
+
     def reset(self) -> tuple[dict[str, Any], dict[str, Any]]:
         """Restore the start state, then record what "start" turned out to be.
 
@@ -715,11 +747,12 @@ class Sim(EnvBase):
         """
         obs, info = super().reset()
         self._warned_nonfinite = False  # the finite flags were just cleared too
-        if self._start_joint_q is None and self.model.body_count:
+        if self._start_joint_q is None and self.model.joint_count:
             # After the base class has warmed up *and* re-posed, so this is the
             # articulation the first episode is actually about to be stepped
             # from -- which is what every later episode has to be given back.
-            # A deformable-only scene has no ``joint_q`` at all, hence the guard.
+            # A scene with no joint has no ``joint_q`` at all, hence the guard:
+            # a deformable-only one, or a static box beside a sheet.
             self._start_joint_q = np.asarray(self.pipeline.snapshot.joint_q, dtype=np.float32).copy()
         self.settled_body_q = self._body_q().copy()
         return obs, info
@@ -771,16 +804,8 @@ class Sim(EnvBase):
         return float(self.sim_time)
 
     def deformables(self) -> dict[str, Any]:
-        """Every entity carrying a particle probe, by name.
-
-        The deformables bin **and** the extras one, because which of the two a
-        thing lands in is decided by its spec's ``stage`` -- a build-order
-        statement -- and not by whether it has particles. A rope is the case
-        that separates them: as a capsule chain it is an ``extras`` entity with
-        no particles at all, and as a centerline it is an ``extras`` entity with
-        nothing but.
-        """
-        return {n: e for n, e in self.scene.by_name.items() if getattr(e, "probe", None) is not None}
+        """Every entity carrying a particle probe, by name: :func:`scene_deformables` of this scene."""
+        return scene_deformables(self.scene)
 
     def particle_probes(self) -> dict[str, Any]:
         """Those entities' probes, which is what a measure is handed."""
@@ -999,6 +1024,15 @@ class Sim(EnvBase):
             raise RuntimeError(f"scene {self.request.full_name!r} has no grippers")
         return grippers[name] if name else next(iter(grippers.values()))
 
+    def suction(self, name: str = ""):
+        """One arm's vacuum cup (:class:`~robosimstudio.core.suction.Suction`), defaulting to the first."""
+        suctions = self.scene.embodiment.suctions if self.scene.embodiment else {}
+        if not suctions:
+            raise RuntimeError(f"scene {self.request.full_name!r} has no suction hand")
+        if name and name not in suctions:
+            raise KeyError(f"no suction hand on arm {name!r}; the cups are on {sorted(suctions)}")
+        return suctions[name] if name else next(iter(suctions.values()))
+
     def __getitem__(self, name: str) -> Ref:
         """The ref for one thing, by name.
 
@@ -1044,6 +1078,27 @@ class Sim(EnvBase):
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}({getattr(self.request, 'full_name', '?')!r}, {len(self.names())} things, t={self.time:.3f}s)"
+
+
+def scene_deformables(scene: Any) -> dict[str, Any]:
+    """Every entity of ``scene`` carrying a particle probe, by name, in build order: what "a deformable" means.
+
+    The one rule, asked of the scene so that whatever holds one shares it: :meth:`Sim.deformables`,
+    the privileged ``sim.get_particle_state`` and ``sim.attach`` (which reach it through one world
+    of a fleet, a ``WorldView`` with no ``deformables`` of its own), and every studio panel that
+    lists, pins, settles or reads one. Three copies of it disagreed: ``sim.attach`` with no entity
+    took the task's first ``deformables``-stage spec, and a cuttable is staged there, so a tofu
+    declared before a towel had the hand pin the eight corners of its cage and report ``attached``
+    while it held nothing.
+
+    The deformables bin **and** the extras one, because which of the two a thing lands in is decided
+    by its spec's ``stage`` -- a build-order statement -- and not by whether it has particles. A rope
+    is the case that separates them: as a capsule chain it is an ``extras`` entity with no particles
+    at all, and as a centerline it is an ``extras`` entity with nothing but. And not every particle
+    carrier: a cuttable owns eight particles, the corners its cage writes back for a page to draw the
+    cut by, with no probe to summarise them and nothing a pin on them moves.
+    """
+    return {n: e for n, e in getattr(scene, "by_name", {}).items() if getattr(e, "probe", None) is not None}
 
 
 def _ref_for(scene: Any, name: str) -> Ref | None:

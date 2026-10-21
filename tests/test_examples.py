@@ -23,12 +23,13 @@ which is also how a reader runs one (``uv run examples/01_cloth/00_towel.py``).
 The tables of scripts and the loader are :mod:`tests.fixtures.examples`.
 
 **This module is the numbered examples**, the ones every tree ships, the rope's
-in ``examples/03_rope/`` among them. Four older flat rope scripts remain under
+in ``examples/03_materials/`` among them. Four older flat rope scripts remain under
 ``examples/scenes/`` in a tree that has them. Where a rule here is every scene
 script's -- it runs, it ships two arms, the page can take hold of it, it parses
 no command line -- they are held to it by the same loop, and the loop covers the
 numbered scripts alone in a tree that does not have them. What only those older
-scripts claim is tested beside them, in a tree that has them.
+scripts claim is tested beside them, in a tree that has them. The scenes under
+``tests/scenes/`` are held to the shape rules too, though no reader runs them.
 
 ``scripts/studio.py`` -- the studio's launcher, in a tree that has it -- is not
 checked here: it takes a registered task id and about fifty flags, which makes
@@ -38,6 +39,7 @@ it a tool rather than an example.
 from __future__ import annotations
 
 import ast
+import importlib.util
 import json
 import os
 import subprocess
@@ -46,10 +48,29 @@ import unittest
 from pathlib import Path
 from textwrap import dedent
 
-from tests.fixtures.examples import DEMOS, EXAMPLES, HAS_ROPE, NUMBERED, ROOT, SCRIPTS, _load, _run
+from tests.fixtures.examples import (
+    DEMO_ENGINES,
+    DEMOS,
+    EXAMPLES,
+    HAS_ROPE,
+    NUMBERED,
+    ROOT,
+    SCENES,
+    SCRIPTS,
+    _load,
+    _path,
+    _run,
+)
+from tests.fixtures.packs import PYTHON_FLAGS, env_without
 
 TIER = "medium"
 """Builds and steps real scenes on a GPU."""
+
+
+def _absent(name: str) -> str:
+    """The engine a scene is built on that this checkout lacks, or ``""``: ``02_superdex`` without ``[superdex]``."""
+    engine = DEMO_ENGINES.get(name, "")
+    return engine if engine and importlib.util.find_spec(engine) is None else ""
 
 
 class TestTheExamplesRun(unittest.TestCase):
@@ -68,8 +89,10 @@ class TestTheExamplesRun(unittest.TestCase):
         can be dragged but not *driven*, and the difference is the whole second
         half of the interaction.
         """
-        for name in SCRIPTS:
+        for name in (*SCRIPTS, *SCENES):
             with self.subTest(example=name):
+                if _absent(name):
+                    self.skipTest(f"[{_absent(name)}] is not installed; {name} cannot be built")
                 sim, _ = _run(name)
                 self.assertEqual(["left", "right"], sorted(sim.handles.arms))
 
@@ -89,10 +112,10 @@ class TestTheExamplesRun(unittest.TestCase):
         sim, _ = _run("04_extending/01_new_kind.py")
         self.assertGreater(len(sim["chain"].bodies), 12, "the kind this file registered")
 
-        sim, _ = _run("03_rope/00_cable.py")
+        sim, _ = _run("03_materials/00_rope.py")
         self.assertEqual(28, len(sim["cable"].bodies), "a cable is a chain of capsules")
 
-        sim, _ = _run("03_rope/01_between_posts.py")
+        sim, _ = _run("tests/scenes/01_between_posts.py")
         self.assertEqual(24, len(sim["cable"].bodies))
         self.assertLessEqual({"post_start", "post_end"}, set(sim.names()))
 
@@ -101,7 +124,7 @@ class TestTheExamplesRun(unittest.TestCase):
         they were built, just over the posts, and the span between them hangs."""
         import numpy as np
 
-        sim, _ = _run("03_rope/01_between_posts.py")
+        sim, _ = _run("tests/scenes/01_between_posts.py")
         sim.run(120).sync()
         bodies = np.asarray(sim["cable"].bodies).ravel()
         z = np.asarray(sim.pipeline.snapshot.body_q)[bodies, 2]
@@ -145,10 +168,32 @@ class TestTheExamplesRun(unittest.TestCase):
         self.assertEqual("vbd", physics.backend_for("soft").solver)
 
 
+WATER = dedent(
+    """
+    import json, runpy, sys
+    import robosimstudio as rss
+
+    opened = []
+    rss.view = lambda sim, **kwargs: opened.append(sim)
+    runpy.run_path(sys.argv[1], run_name="__main__")
+    (sim,) = opened
+    physics = sim.request.physics
+    sim.run(20).sync()
+    print(json.dumps({
+        "water": physics.backend_for("water").solver,
+        "rigid": physics.backend_for("rigid").solver,
+        "particles": len(sim["water"].particles),
+        "finite": bool(sim.state_is_finite()),
+    }))
+    """
+).strip()
+"""The water example run by path in a process of its own, as :data:`ALONE` runs one with a kind left out."""
+
+
 class TestTheMultiEngineDemos(unittest.TestCase):
     """The scripts that are the whole multi-engine claim, and were in no test.
 
-    ``02_soft/00_sponge`` and ``03_rope/02_superdex`` are the smallest thing that
+    ``02_soft/00_sponge`` and ``tests/scenes/02_superdex`` are the smallest thing that
     proves a foreign engine simulates a deformable beside a Newton arm, and until
     then nothing ran them.
     They cannot join :data:`SCRIPTS`: the scene scripts are held to a bimanual
@@ -180,20 +225,48 @@ class TestTheMultiEngineDemos(unittest.TestCase):
 
         if importlib.util.find_spec("superdex") is None:
             self.skipTest("[superdex] is not installed; the engine cannot be reached")
-        sim, _ = _run("03_rope/02_superdex.py")
+        sim, _ = _run("tests/scenes/02_superdex.py")
         cable = sim["cable"]
         self.assertEqual("superdex", sim.request.physics.backend_for("rod").solver)
         self.assertEqual("mujoco", sim.request.physics.backend_for("articulated").solver)
         self.assertEqual(29, len(cable.particles), "28 elements are 29 nodes")
         self.assertEqual(0, len(cable.entity.owned_bodies()), "a centerline owns no capsule")
         sim.run(20).sync()
-        self.assertTrue(sim.state_is_finite(), "examples/03_rope/02_superdex.py diverged in twenty steps")
+        self.assertTrue(sim.state_is_finite(), "tests/scenes/02_superdex.py diverged in twenty steps")
+
+    def test_the_water_is_an_sph_liquid_on_genesis(self) -> None:
+        """The water's scene: it builds, it steps, the water is Genesis's and the cup the arm's island's.
+
+        Skips where Genesis is absent, which is the checkout's own environment: the
+        extra lives in a virtual environment of its own (``examples/03_materials/README.md``). In a
+        process of its own, because Genesis is initialised once per process: built
+        here, the water's float32 would be what ``tests/test_genesis``, after this module
+        in a tier run, found, where an IPC island is refused (its harvest asks for float64)."""
+        import importlib.util
+
+        if importlib.util.find_spec("genesis") is None:
+            self.skipTest("[genesis] is not installed here; it lives in a virtual environment of its own")
+        proc = subprocess.run(
+            [sys.executable, "-c", WATER, str(EXAMPLES / "03_materials/14_water.py")],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=900,
+            check=False,
+        )
+        self.assertEqual(0, proc.returncode, proc.stderr[-3000:])
+        got = json.loads([line for line in proc.stdout.splitlines() if line.startswith("{")][-1])
+        self.assertEqual("genesis", got["water"])
+        self.assertEqual("mujoco", got["rigid"])
+        self.assertEqual(1728, got["particles"])
+        self.assertTrue(got["finite"], "examples/03_materials/14_water.py diverged in twenty steps")
 
     def test_each_demo_stages_its_engine_for_the_domain_it_is_about(self) -> None:
         """Static, so it holds whichever wheels are present: the arrangement is data."""
-        for name, engine in zip(DEMOS, ("superdex", "superdex"), strict=True):
+        self.assertLessEqual(set(DEMOS), set(DEMO_ENGINES), "every demo states the engine it is about")
+        for name, engine in DEMO_ENGINES.items():
             with self.subTest(demo=name):
-                text = (EXAMPLES / name).read_text()
+                text = _path(name).read_text()
                 ast.parse(text)
                 self.assertIn(engine, text, "the demo must name the engine it demonstrates")
 
@@ -225,8 +298,8 @@ class TestThePageCanTakeHoldOfIt(unittest.TestCase):
         for name, expected in (
             ("00_getting_started/01_core_concepts.py", {"cube", "ball"}),
             ("04_extending/01_new_kind.py", {"chain"}),
-            ("03_rope/00_cable.py", {"cable"}),
-            ("03_rope/01_between_posts.py", {"cable"}),
+            ("03_materials/00_rope.py", {"cable"}),
+            ("tests/scenes/01_between_posts.py", {"cable"}),
             *(rope if HAS_ROPE else ()),
         ):
             with self.subTest(example=name):
@@ -234,14 +307,16 @@ class TestThePageCanTakeHoldOfIt(unittest.TestCase):
                 try:
                     for _ in range(4):
                         session.tick()
-                    self.assertIsNotNone(session.objects, f"examples/{name} has nothing draggable")
+                    self.assertIsNotNone(session.objects, f"{_path(name).relative_to(ROOT)} has nothing draggable")
                     self.assertLessEqual(expected, set(session.objects.names))
                 finally:
                     session.teardown()
 
     def test_every_example_offers_a_handle_on_the_robot(self) -> None:
-        for name in SCRIPTS:
+        for name in (*SCRIPTS, *SCENES):
             with self.subTest(example=name):
+                if _absent(name):
+                    self.skipTest(f"[{_absent(name)}] is not installed; {name} cannot be built")
                 _, session = self._page(name)
                 try:
                     session.tick()
@@ -291,9 +366,9 @@ class TestTheShape(unittest.TestCase):
         ``studio`` is deliberately not in this list. It is the launcher -- it
         takes a registered task id -- and a command line is what makes it one.
         """
-        for name in (*SCRIPTS, *DEMOS):
+        for name in (*SCRIPTS, *DEMOS, *SCENES):
             with self.subTest(example=name):
-                source = (EXAMPLES / name).read_text()
+                source = _path(name).read_text()
                 self.assertNotIn("argparse", source)
                 tree = ast.parse(source)
                 mains = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main"]
@@ -313,9 +388,9 @@ class TestTheShape(unittest.TestCase):
     def test_each_numbered_script_ends_by_opening_the_studio(self) -> None:
         """``import robosimstudio as rss`` at the top, ``rss.view(...)`` as the last
         thing ``main()`` does, and ``main()`` called only when the file is run."""
-        for name in (*NUMBERED, *DEMOS):
+        for name in (*NUMBERED, *DEMOS, *SCENES):
             with self.subTest(example=name):
-                tree = ast.parse((EXAMPLES / name).read_text())
+                tree = ast.parse(_path(name).read_text())
                 imports = [a for n in tree.body if isinstance(n, ast.Import) for a in n.names]
                 self.assertIn(("robosimstudio", "rss"), [(a.name, a.asname) for a in imports])
                 main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
@@ -373,10 +448,17 @@ class TestTheShape(unittest.TestCase):
                 self.assertFalse(lines[0].rstrip().endswith("."), "a title takes no full stop")
                 self.assertTrue(len(lines) == 1 or not lines[1].strip(), "line 2 is blank")
 
+    def test_every_test_scene_is_in_the_table(self) -> None:
+        """A scene put under ``tests/scenes/`` is held to the rules above once :data:`SCENES` names it."""
+        found = sorted(path.relative_to(ROOT).as_posix() for path in (ROOT / "tests" / "scenes").glob("[0-9]*_*.py"))
+        self.assertEqual(found, sorted(SCENES))
+
     def test_no_numbered_script_is_a_pack(self) -> None:
-        """A kind's folder is on ``robosimstudio.domains``'s path, and what keeps
-        its examples from being scanned as kinds is their name: it starts with a
-        digit, so it is not an identifier (``tests/test_domain_packs.py``)."""
+        """An example folder may be put on ``robosimstudio.domains``'s path as a
+        domain root of somebody's own, and what keeps its scripts from being
+        scanned as kinds is their name: it starts with a digit, so it is not an
+        identifier (``tests/test_registry_discovery.py``). The shipped folders
+        are on no path; the rule still holds for every one of them."""
         for name in _numbered_scripts():
             with self.subTest(example=name):
                 self.assertFalse(Path(name).stem.isidentifier())
@@ -392,7 +474,7 @@ ALONE = dedent(
     runpy.run_path(sys.argv[1], run_name="__main__")
     (sim,) = opened
     sim.run(20).sync()
-    other = "robosimstudio.domains." + sys.argv[2]
+    other = "robosimstudio_materials." + sys.argv[2]
     print(json.dumps({
         "finite": bool(sim.state_is_finite()),
         "particles": int(sim.model.particle_count),
@@ -404,51 +486,50 @@ ALONE = dedent(
 
 
 class TestEachKindsFolderStandsAlone(unittest.TestCase):
-    """Each kind is its own folder and an independent example: one runs with the others gone.
+    """Each kind's examples are independent of the other kinds: one runs with another gone.
 
-    The cloth, soft and rope folders are each a root of
-    ``robosimstudio.domains``. Here a fresh process is given *one* of them as its
-    only root -- so the other kind is not merely unimported but not there to
-    import -- and runs an example out of that folder exactly as a reader would,
-    by path, through to twenty steps. ``soft.py`` once reached into ``cloth.py``
-    for a helper inside two of its methods, which no import-time check could
-    see and the first build did.
+    The cloth, soft and rope kinds are each one module of
+    ``robosimstudio_materials``. Here a fresh process is given a copy of that
+    package with another kind left out -- so the other kind is not merely
+    unimported but not there to import -- and runs an example out of a folder
+    exactly as a reader would, by path, through to twenty steps. ``soft.py``
+    once reached into ``cloth.py`` for a helper inside two of its methods, which
+    no import-time check could see and the first build did.
     """
 
     def _alone(self, example: str, other: str) -> dict:
-        from robosimstudio import roots
+        from contextlib import ExitStack
 
-        folder = (EXAMPLES / example).parent
-        env = {**os.environ, roots.DOMAIN_ROOTS_ENV: str(folder), f"{roots.DOMAIN_ROOTS_ENV}_ONLY": "1"}
-        proc = subprocess.run(
-            [sys.executable, "-c", ALONE, str(EXAMPLES / example), other],
-            cwd=ROOT,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=900,
-            check=False,
-        )
+        with ExitStack() as stack:
+            proc = subprocess.run(
+                [sys.executable, *PYTHON_FLAGS, "-c", ALONE, str(EXAMPLES / example), other],
+                cwd=ROOT,
+                env={**env_without(stack, other), "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES", "")},
+                capture_output=True,
+                text=True,
+                timeout=900,
+                check=False,
+            )
         self.assertEqual(0, proc.returncode, proc.stderr[-3000:])
         return json.loads([line for line in proc.stdout.splitlines() if line.startswith("{")][-1])
 
     def test_a_soft_example_builds_and_steps_with_no_cloth(self) -> None:
         got = self._alone("02_soft/01_tet_mesh.py", "cloth")
-        self.assertFalse(got["other_findable"], "the cloth folder was meant to be off the path")
+        self.assertFalse(got["other_findable"], "the cloth kind was meant to be left out of the package")
         self.assertFalse(got["other_loaded"])
         self.assertEqual(112, got["particles"])
         self.assertTrue(got["finite"])
 
     def test_a_cloth_example_builds_and_steps_with_no_soft(self) -> None:
         got = self._alone("01_cloth/00_towel.py", "soft")
-        self.assertFalse(got["other_findable"], "the soft folder was meant to be off the path")
+        self.assertFalse(got["other_findable"], "the soft kind was meant to be left out of the package")
         self.assertFalse(got["other_loaded"])
         self.assertGreater(got["particles"], 500)
         self.assertTrue(got["finite"])
 
     def test_a_rope_example_builds_and_steps_with_no_cloth(self) -> None:
-        got = self._alone("03_rope/00_cable.py", "cloth")
-        self.assertFalse(got["other_findable"], "the cloth folder was meant to be off the path")
+        got = self._alone("03_materials/00_rope.py", "cloth")
+        self.assertFalse(got["other_findable"], "the cloth kind was meant to be left out of the package")
         self.assertFalse(got["other_loaded"])
         self.assertEqual(0, got["particles"], "a capsule chain is bodies, not particles")
         self.assertTrue(got["finite"])

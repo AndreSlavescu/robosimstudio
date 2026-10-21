@@ -76,6 +76,34 @@ def scoring_refusal(scene) -> str:
     giving :meth:`FleetEnv.context` a per-world :class:`ParticleProbe` and a
     per-world view of each extra entity, **both**, not the probe alone.
     """
+    # "Does this publish", not "which view holds it". The old test was
+    # ``scene.extras``, which is a build-order bin: a publisher that happened to
+    # own a handle sat in ``objects`` and slipped through, and one that published
+    # nothing sat in ``extras`` and was refused for it.
+    #
+    # A publisher that has declared itself world aware is *not* refused. It reads
+    # ``WorldState.world`` and answers off that world's rows, which is the whole
+    # of what was missing -- and :meth:`FleetEnv.context` now hands it the world
+    # and hands the goal language the entity objects to ask.
+    #
+    # Asked before the particles, because what an entity publishes is what a
+    # goal reads off it. A cutting block publishes its cutter's ``pieces``, and
+    # its eight particles are only the corners it is drawn at. Asked second, a
+    # one-world wave of the cutting task was refused for the corners, saying the
+    # physics replicates, which the cutter's does not: at two worlds the compiler
+    # refuses its one-world substep hooks (``e9_cut_fleet.py``).
+    publishers = sorted(
+        name
+        for name, entity in scene.by_name.items()
+        if type(entity).published_states is not Entity.published_states
+        and not getattr(type(entity), "world_aware", False)
+    )
+    if publishers:
+        return (
+            f"the scene has entities publishing states ({', '.join(publishers)}) that a wave cannot read "
+            "per world. Each one needs a world axis over whatever it publishes from and "
+            "`world_aware = True` to say so"
+        )
     # An entity that opened a probe per world is not refused: a wave hands a
     # goal that world's probe, over that world's block of the particle array.
     # One that did not would answer every world with the first world's
@@ -89,27 +117,6 @@ def scoring_refusal(scene) -> str:
             f"the scene has entities made of particles ({', '.join(particled)}) and a wave has no per-world "
             "particle probe for them, so their success would be scored from one world's particles. The "
             "physics replicates correctly -- only the scoring is missing"
-        )
-    # "Does this publish", not "which view holds it". The old test was
-    # ``scene.extras``, which is a build-order bin: a publisher that happened to
-    # own a handle sat in ``objects`` and slipped through, and one that published
-    # nothing sat in ``extras`` and was refused for it.
-    #
-    # A publisher that has declared itself world aware is *not* refused. It reads
-    # ``WorldState.world`` and answers off that world's rows, which is the whole
-    # of what was missing -- and :meth:`FleetEnv.context` now hands it the world
-    # and hands the goal language the entity objects to ask.
-    publishers = sorted(
-        name
-        for name, entity in scene.by_name.items()
-        if type(entity).published_states is not Entity.published_states
-        and not getattr(type(entity), "world_aware", False)
-    )
-    if publishers:
-        return (
-            f"the scene has entities publishing states ({', '.join(publishers)}) that a wave cannot read "
-            "per world. Each one needs a world axis over whatever it publishes from and "
-            "`world_aware = True` to say so"
         )
     return ""
 
@@ -699,9 +706,13 @@ class FleetEnv:
             raise ValueError(f"expected {self.num_worlds} episodes, got {len(episodes)}")
         if documents is not None and len(documents) != self.num_worlds:
             raise ValueError(f"expected {self.num_worlds} documents, got {len(documents)}")
-        self.episodes = list(episodes)
-        self.documents = list(documents) if documents is not None else [None] * self.num_worlds
-        self._check_documents()
+        episodes = list(episodes)
+        documents = list(documents) if documents is not None else [None] * self.num_worlds
+        # Checked before either is kept: a caller that catches the refusal holds
+        # the wave its state still holds, not the one refused.
+        self._check_documents(documents)
+        self._check_statics(episodes, documents)
+        self.episodes, self.documents = episodes, documents
         # A document's active set decides what a world parks, so a table
         # restricted under the last wave's documents is not this wave's.
         self._restricted.clear()
@@ -975,8 +986,8 @@ class FleetEnv:
         document = self.documents[int(world)]
         return self.task if document is None else document
 
-    def _check_documents(self) -> None:
-        """Refuse a wave whose documents do not all key to the model that was built.
+    def _check_documents(self, documents: Sequence[TaskSpec | None]) -> None:
+        """Refuse a wave whose ``documents`` do not all key to the model that was built.
 
         A wave is ``W`` copies of one model, so a document whose pairing,
         physics, control mode or rig differs is a different model and not a
@@ -993,7 +1004,7 @@ class FleetEnv:
         from robosimstudio_bench.run.fleet import fleet_build_task
 
         base = self.build_task.full_name
-        running = [(w, d) for w, d in enumerate(self.documents) if d is not None]
+        running = [(w, d) for w, d in enumerate(documents) if d is not None]
         if not running:
             return
         # Compared against the first DOCUMENT of the wave, not against
@@ -1035,6 +1046,49 @@ class FleetEnv:
                 f"({base!r}) is {mine}. A superset base may size the constraint buffers for the "
                 "union and may not change the integration"
             )
+
+    def _check_statics(self, episodes: Sequence[Episode | None], documents: Sequence[TaskSpec | None]) -> None:
+        """Refuse a wave that would stand a static object anywhere but where the model holds it.
+
+        A static object (``ObjectSpec.static``) is welded to the world at build,
+        at the template episode's pose, or stands where the arena's import put
+        it, and nothing in a wave moves it: :meth:`_write_wave` writes
+        coordinates and it has none, :meth:`_place_documents` asks only an entity
+        that offers ``place_from_document``, and :meth:`_reset_entities` only a
+        world-aware one. So every world stood the object at the template's pose,
+        whatever its own episode or document said, and was scored as though it
+        stood where asked. Asked here of each world's layout as :meth:`_write_wave`
+        composes an object's (:meth:`_declared_for`, then the episode), only of
+        the objects that hold a pose (``held_at``), and refused by name rather
+        than placed: see :meth:`~robosimstudio.domains.rigid.entity.EntityRigid.move_refusal`.
+
+        A superset's instance whose own start poses put it elsewhere than its base
+        does is refused for that, with its own way out. Its serial runs build its
+        own model, with the object where those poses put it (the lowering's
+        default where they omit it), and a wave's rows are those rows; no model
+        key separates two documents of one base.
+
+        Raises:
+            CannotReplicate: Naming the world, its document and the object.
+        """
+        statics = {name: e for name, e in self.scene.objects.items() if getattr(e, "held_at", None) is not None}
+        if not statics:
+            return
+        for world, episode in enumerate(episodes):
+            if episode is None:
+                continue
+            document = self.task if documents[world] is None else documents[world]
+            declared = self._declared_for(document)
+            for name, entity in statics.items():
+                why = entity.move_refusal(episode, base=declared.get(name))
+                if not why:
+                    continue
+                if document is not self.build_task and not entity.move_refusal(episode, base=self._declared[name]):
+                    raise CannotReplicate(
+                        f"world {world} runs {document.full_name!r}, and {why}. That pose is its own start poses', "
+                        f"and it runs on its fleet base's model: state it where {self.build_task.full_name!r} does"
+                    )
+                raise CannotReplicate(f"world {world} runs {document.full_name!r}, and {why}. {entity.move_remedy}")
 
     # ------------------------------------------------------------------ parking
     def _active_for(self, episode: Episode | None, world: int = 0) -> frozenset[str] | None:

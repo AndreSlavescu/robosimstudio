@@ -38,16 +38,16 @@ from dataclasses import fields
 from typing import Any
 
 import numpy as np
-from robosimstudio.domains.cloth import ClothMaterialSpec
 
-from robosimstudio.scene.tuning import ClothTarget, LiveMaterial, locate_cloth
+from robosimstudio.scene.tuning import CONTACT_SCALARS, ClothTarget, LiveMaterial, locate_cloth
 from robosimstudio.specs.params import LIVE, RECAPTURE, param_ui
+from robosimstudio_materials.cloth import ClothMaterialSpec
 
 __all__ = ["ClothTarget", "LiveMaterial", "apply_contact", "contact_differs", "locate_cloth", "rebuild_fields"]
 
 
 # ------------------------------------------------------------- recapture tier
-_CONTACT = {"contact_ke": "soft_contact_ke", "contact_kd": "soft_contact_kd", "friction": "soft_contact_mu"}
+_CONTACT = CONTACT_SCALARS
 """Material field -> the model scalar it sets. Global, not per cloth."""
 
 

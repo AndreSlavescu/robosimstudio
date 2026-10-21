@@ -276,7 +276,10 @@ class PhysicsProgram:
 
 
 def _channels(graph: InteractionGraph, islands: list[Island], worlds, model: newton.Model) -> list[Channel]:
-    """Proxy channels: for every cross-island edge, the rigid side's bodies into the deformable side."""
+    """Proxy channels: for every cross-island edge, the rigid side's bodies into the deformable side.
+
+    Into a host engine's island, the other side's bodies from whichever island holds them.
+    """
     by_entity = {node.name: next((i for i in islands if i.owns(node.name)), None) for node in graph.nodes.values()}
     gathered: dict[tuple[str, str, str], dict[str, Any]] = {}
     for edge in graph.edges:
@@ -285,7 +288,16 @@ def _channels(graph: InteractionGraph, islands: list[Island], worlds, model: new
         if ia is None or ib is None or ia is ib:
             continue
         # The deformable island is the destination; the other island's bodies are proxied.
-        if ia.is_deformable and not ib.is_deformable:
+        if ia.is_host_engine != ib.is_host_engine:
+            # A host engine mirrors the other side's bodies whichever Newton island integrates
+            # them. A cube on GENERIC's VBD beside a towel on SuperDex is two particle islands,
+            # and skipped as such the cube had no mirror: the towel dropped over a static 10 cm
+            # cube lay through it on the bench, its node over the cube at 0.751 m, and lies on it
+            # now at 0.855 m, the top at 0.849 m (``c5a_drape.py``, a free cube the same). A node
+            # with no bodies -- a VBD towel beside a SuperDex sponge -- still has none to mirror.
+            dest, src, src_node = (ia, ib, b) if ia.is_host_engine else (ib, ia, a)
+            hands_only = edge.hands_only
+        elif ia.is_deformable and not ib.is_deformable:
             dest, src, src_node, hands_only = ia, ib, b, edge.hands_only
         elif ib.is_deformable and not ia.is_deformable:
             dest, src, src_node, hands_only = ib, ia, a, edge.hands_only and False
@@ -506,11 +518,21 @@ def _warn_lost_material(node: Any, declared: HostActor, island: Any) -> None:
     states ``tri_ke`` and ``edge_ke``, none states ``shell_young``, and so
     packing tape and bath towelling reached both foreign engines at the same
     ``E = 1e5``. Measured; nothing said so; this says so.
+
+    A kind whose matter is stated on its spec rather than in a material names
+    the spec fields its implementation never reads, as the entity class's
+    ``unread_fields``; those stated away from the spec's defaults are lost the
+    same way. Its actor's params cannot say it by their keys: a Cosserat rope
+    hands over an ``axial_stiffness`` derived from its modulus, and a rope
+    stating ``dahl_eps_max=0.5``, ``twist_ke``, ``shear_ke``, ``bend_ke`` and
+    ``stretch_ke`` -- the capsule chain's -- built and stepped on SuperDex with
+    no message at all.
     """
     engine = island.backend.solver
     info = get_backend(engine)
-    # The kind's own builder first -- a shell builder never reads ``friction``,
-    # and only it can say so -- the engine-wide declaration as the fallback.
+    # The kind's own builder first -- Genesis's shell builder never reads
+    # ``friction`` and SuperDex's does, and only each can say so -- the
+    # engine-wide declaration as the fallback.
     consumes = actor_consumes(engine, declared.kind) or info.consumes
     if consumes:
         unread = sorted(set(declared.params) - set(consumes))
@@ -521,27 +543,111 @@ def _warn_lost_material(node: Any, declared: HostActor, island: Any) -> None:
                 MaterialLossWarning,
                 stacklevel=3,
             )
-    material = getattr(getattr(node.entity, "spec", None), "material", None)
-    if material is None or not dataclasses.is_dataclass(material):
-        return
-    default = type(material)()
-    stated = [f.name for f in dataclasses.fields(material) if getattr(material, f.name) != getattr(default, f.name)]
-    # Fields that travel some other way than the actor's params -- a tet body's
-    # Young and Poisson go into ``model.tet_materials`` and the bridge inverts
-    # them back out -- are not lost, and saying so sends a reader hunting for a
-    # bug in a modulus that is in fact applied.
-    carried = set(getattr(type(material), "via_model", ()))
-    lost = [name for name in stated if name not in declared.params and name not in carried]
+    spec = getattr(node.entity, "spec", None)
+    material = getattr(spec, "material", None)
+    # Each record named for itself, so the reader is sent to the one holding the field:
+    # a rope's lost fields are its RodSpec's, and a cloth's are its material's.
+    lost: list[str] = []
+    hint = ""
+    if material is not None and dataclasses.is_dataclass(material):
+        # Fields that travel some other way than the actor's params -- a tet body's
+        # Young and Poisson go into ``model.tet_materials`` and the bridge inverts
+        # them back out -- are not lost, and saying so sends a reader hunting for a
+        # bug in a modulus that is in fact applied.
+        carried = set(getattr(type(material), "via_model", ()))
+        # And a field the actor carries under another name: a fabric's ``shell_young`` is a shell's ``young``.
+        renamed = dict(getattr(type(material), "actor_names", {}))
+        names = [
+            name for name in _stated(material) if renamed.get(name, name) not in declared.params and name not in carried
+        ]
+        if names:
+            lost.append(f"{len(names)} stated material field(s) never reach {engine}: {names}")
+        unset = [f.name for f in dataclasses.fields(material) if getattr(material, f.name) is None]
+        hint = f" Knobs this material offers and leaves unset: {unset}." if unset else ""
+    unread = tuple(getattr(type(node.entity), "unread_fields", ()))
+    if unread and dataclasses.is_dataclass(spec):
+        names = _stated(spec, unread)
+        if names:
+            lost.append(f"{len(names)} stated {type(spec).__name__} field(s) never reach {engine}: {names}")
     if not lost:
         return
-    unset = [f.name for f in dataclasses.fields(material) if getattr(material, f.name) is None]
-    hint = f" Knobs this material offers and leaves unset: {unset}." if unset else ""
     warnings.warn(
-        f"{node.name!r}: {len(lost)} stated material field(s) never reach {engine}: {lost}. "
-        f"What the engine is handed: {sorted(declared.params)}.{hint}",
+        f"{node.name!r}: {'; '.join(lost)}. What the engine is handed: {sorted(declared.params)}.{hint}",
         MaterialLossWarning,
         stacklevel=3,
     )
+
+
+def _stated(record: Any, names: tuple[str, ...] | None = None) -> list[str]:
+    """``record``'s fields (or those of ``names``) that differ from a default-built one, in order.
+
+    Compared as values (:func:`_as_value`): a rope given ``surface_labels=["table"]`` states
+    nothing its default ``("table",)`` does not, and a list never equals a tuple.
+    """
+    default = type(record)()
+    names = tuple(f.name for f in dataclasses.fields(record)) if names is None else names
+    return [name for name in names if _as_value(getattr(record, name)) != _as_value(getattr(default, name))]
+
+
+def _as_value(value: Any) -> Any:
+    """``value`` with every list, tuple and array in it a tuple, for :func:`_stated` to compare.
+
+    And every numpy number in it a Python one, a float as the shortest decimal that is it at its own
+    width: ``np.float32(0.1)`` is ``0.1``. An array went through ``tolist``, which widens each float32
+    to the float64 nearest it, so an MPM material's ``color`` given as a float32 array of its default
+    ``(0.86, 0.8, 0.62)`` compared as ``0.8600000143...`` and was named stated. A float32 scalar beside
+    its default compares equal on numpy 2 (NEP 50 casts the Python float to float32) and not on 1.x.
+    """
+    if isinstance(value, np.ndarray):
+        value = value[()] if value.ndim == 0 else list(value)
+    if isinstance(value, (list, tuple)):
+        return tuple(_as_value(item) for item in value)
+    if isinstance(value, np.floating):
+        return float(str(value))
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _check_in_place_rates(arrangement: ArrangementSpec, islands: list[Island]) -> None:
+    """Refuse an in-place island whose own rate does not fit a control step whole.
+
+    An in-place solver may step slower than the substep loop by taking a
+    ``step_hz`` and skipping the calls between its steps
+    (:attr:`~robosimstudio.specs.registries.BackendInfo.steps_in_place`). The
+    skipping is host-side and a captured graph bakes it in, so it is right only
+    when every control step holds the same whole number of its steps: the call
+    rate (``control_hz * substeps``, times the entry's own substeps when a
+    coupler steps it; a lone island is built bare and called once a substep)
+    must be an integer multiple of ``step_hz``, and that multiple must divide
+    the calls in a control step. A rate above the call rate is a ceiling and
+    steps every call.
+
+    Raises:
+        CompositionError: Naming the island, the rates, and the rates that fit.
+    """
+    for island in islands:
+        if not get_backend(island.backend.solver).steps_in_place:
+            continue
+        params = effective_backend(island.backend, has_particles=bool(island.particles.size)).kwargs()
+        step_hz = params.get("step_hz")
+        if step_hz is None:
+            continue
+        entry = int(island.backend.substeps) if len(islands) > 1 else 1  # build_bare has no entry to substep
+        calls = int(arrangement.substeps) * entry
+        call_hz = float(arrangement.control_hz) * calls
+        ratio = call_hz / float(step_hz)
+        if ratio < 1.0 - 1.0e-6:
+            continue
+        stride = max(1, int(round(ratio)))
+        if abs(ratio - stride) > 1.0e-6 or calls % stride:
+            fits = sorted({call_hz / k for k in range(1, calls + 1) if calls % k == 0})
+            raise CompositionError(
+                f"island {island.name!r} ({island.backend.solver}) states step_hz={float(step_hz):g}, which does not "
+                f"fit the arrangement's {call_hz:g} Hz call rate a whole number of times per control step; a captured "
+                f"control step would hold a fraction of one of its steps. At control_hz={arrangement.control_hz:g} "
+                f"with {calls} calls per control step the rates that fit are {[f'{v:g}' for v in fits]}."
+            )
 
 
 def compose(
@@ -606,6 +712,7 @@ def compose(
             get_coupler(arrangement.coupling.method)
         except KeyError as exc:
             raise CompositionError(str(exc)) from exc
+    _check_in_place_rates(arrangement, newton_islands)
 
     world_shapes = (
         np.flatnonzero(model.shape_body.numpy() < 0).astype(np.int32) if model.shape_count else np.zeros(0, np.int32)
@@ -633,7 +740,7 @@ def compose(
         routing.main_pairs = None
     if routing.main_pairs is not None:
         kwargs: dict[str, Any] = {
-            "soft_contact_margin": float(spec.soft_contact_margin),
+            "soft_contact_gap": float(spec.soft_contact_margin),
             "enable_rigid_soft_full_surface_contact": bool(spec.full_surface_contact),
             "contact_matching": spec.contact_matching,
         }
@@ -699,6 +806,25 @@ def compose(
                 _inner.rebuild_bvh(solver.entry_state(_name) if _views else state)
 
             schedule.add(Stage(name=f"rebuild_bvh:{island.name}", fn=rebuild, phase="before"))
+        if getattr(inner, "grid_type", None) == "sparse" and hasattr(inner, "check_sparse_grid_rebuild_status"):
+            # Once per control step, outside the graph: a capacity-bounded
+            # sparse grid that overflows keeps stepping and keeps the failure
+            # in a device-side status word, so nothing raises on its own. The
+            # check reads that word (a device sync) and names the knobs.
+            def grid_check(state, dt, _inner=inner, _name=island.name) -> None:
+                del state, dt
+                try:
+                    _inner.check_sparse_grid_rebuild_status()
+                except RuntimeError as exc:
+                    if "capacity" not in str(exc) and "status" not in str(exc):
+                        raise  # a CUDA fault surfacing at this sync is not a capacity question
+                    raise RuntimeError(
+                        f"island {_name!r}: its sparse grid overflowed the capacity it was built with ({exc}). "
+                        "Raise max_active_cell_count, max_lower_node_count or max_upper_node_count on that "
+                        "island's backend, or keep the material in a smaller volume."
+                    ) from exc
+
+            schedule.add(Stage(name=f"mpm_grid_check:{island.name}", fn=grid_check, phase="after"))
     for name, host in host_solvers.items():
         # The co-simulation tick: eager, once per control step, after the
         # substeps and before the batched read-back -- ``after`` rather than

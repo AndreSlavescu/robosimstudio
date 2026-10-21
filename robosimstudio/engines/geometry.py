@@ -32,6 +32,7 @@ from newton import GeoType
 
 from robosimstudio.core.math import young_poisson_from_lame
 from robosimstudio.registry import Registry
+from robosimstudio.roots import DOMAIN_PACKAGES
 from robosimstudio.specs.physics import actor_consumes, declare_consumes, engine_consumes
 
 __all__ = [
@@ -252,6 +253,9 @@ class ActorGeometry:
             island backend's rather than the model's (a cloth spec speaks its
             solver's stiffnesses, not Young and Poisson).
         params: the entity's :class:`~robosimstudio.specs.physics.HostActor` params, verbatim.
+        lumping: the record's ``lumping``, how Newton's builder shared the
+            actor's mass among its particles (``"grid"`` or ``"mesh"``), or
+            ``None`` where the record does not say.
     """
 
     name: str
@@ -264,6 +268,7 @@ class ActorGeometry:
     young: float | None = None
     poisson: float | None = None
     params: dict = field(default_factory=dict)
+    lumping: str | None = None
 
 
 ActorReader = Callable[[Any, "ActorGeometry"], "ActorGeometry"]
@@ -274,7 +279,7 @@ positions and the declared params -- everything derivable without knowing what
 kind of thing it is. A reader adds the rest: the connectivity cut out of the
 model's global tables, and whatever material the model itself states."""
 
-ACTOR_KINDS: Registry[ActorReader] = Registry("actor kind", ("robosimstudio.domains",))
+ACTOR_KINDS: Registry[ActorReader] = Registry("actor kind", DOMAIN_PACKAGES)
 """How each kind of deformable actor is read off the model.
 
 **Open, and that is the whole point of it existing.** This was an ``if kind ==
@@ -294,7 +299,7 @@ import one before asking. The scan is a string and runs inside a lookup, so
 importing this module still names nothing above it."""
 
 
-ACTOR_BUILDERS: Registry[Callable[..., Any]] = Registry("actor builder", ("robosimstudio.domains",))
+ACTOR_BUILDERS: Registry[Callable[..., Any]] = Registry("actor builder", DOMAIN_PACKAGES)
 """``"<engine>:<kind>"`` -> how that engine builds that kind of actor.
 
 The other half of :data:`ACTOR_KINDS`. Reading a kind off the Newton model was
@@ -386,8 +391,16 @@ def _read_tet(model: Any, base: ActorGeometry) -> ActorGeometry:
     return replace(base, tets=tets, young=young, poisson=poisson)
 
 
+def _read_sph(model: Any, base: ActorGeometry) -> ActorGeometry:
+    """A liquid: its particles alone, with no triangle and no tetrahedron to read."""
+    del model
+    return base
+
+
 register_actor_kind("shell", _read_shell, summary="A membrane: triangles with thickness-integrated stiffness.")
 register_actor_kind("tet", _read_tet, summary="A volume: tetrahedra, with the model's own Lame pair.")
+# Read here, beside the other two, so the set of kinds does not depend on whether an engine was imported.
+register_actor_kind("sph", _read_sph, summary="A liquid: particles with no connectivity, for an SPH solver.")
 
 
 def actor_geometry(model: Any, record: dict) -> ActorGeometry:
@@ -408,5 +421,14 @@ def actor_geometry(model: Any, record: dict) -> ActorGeometry:
     kind = str(record.get("kind", "tet"))
     name = str(record.get("name", f"{kind}:{start}"))
     rest = np.asarray(model.particle_q.numpy()[start : start + count], dtype=np.float64)
-    base = ActorGeometry(name, kind, start, count, rest, params=dict(record.get("params", {})))
+    lumping = record.get("lumping")
+    base = ActorGeometry(
+        name,
+        kind,
+        start,
+        count,
+        rest,
+        params=dict(record.get("params", {})),
+        lumping=None if lumping is None else str(lumping),
+    )
     return ACTOR_KINDS.get(kind)(model, base)

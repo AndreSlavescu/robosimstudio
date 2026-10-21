@@ -47,11 +47,12 @@ import numpy as np
 
 from robosimstudio.core.probes.particle import ParticleProbe
 from robosimstudio.registry import Registry
+from robosimstudio.roots import DOMAIN_PACKAGES
 
 __all__ = ["CAPABILITIES", "ParticleMixin", "host_bridge", "register_capability"]
 
 
-CAPABILITIES: Registry[type] = Registry("capability", ("robosimstudio.domains",), same=operator.is_)
+CAPABILITIES: Registry[type] = Registry("capability", DOMAIN_PACKAGES, same=operator.is_)
 """Capability mixins published by the domain packs that ship them, by class name.
 
 Filled by :func:`register_capability` while a pack is imported, and read by this
@@ -125,6 +126,12 @@ class ParticleMixin:
     """The radius a renderer sweeps a centerline by, or 0 for a kind drawn from
     its triangles. A centerline owns no triangle, so without it the path tracer
     drew a simulated, measured curve as nothing at all."""
+
+    settle_run: tuple[int, int] | None = None
+    """The run this thing joined the scene's settle with (:meth:`join_settle`), ``None`` for none.
+
+    What the studio's **Re-settle** runs again, so that it settles each thing as the build did
+    rather than as its spec's fields suggest it might have."""
 
     def bind(self, model: newton.Model) -> None:
         """Take this thing's particle range off the model and open a probe per world.
@@ -224,8 +231,10 @@ class ParticleMixin:
         pipeline, ``particle_settles``: a *run* (``(frames, substeps)``) one of
         them already ran is not run again, and each that has snapshotted
         snapshots again after one that is. ``run=None`` joins without settling,
-        as a kind that does not settle does.
+        as a kind that does not settle does. The run is kept as :attr:`settle_run`,
+        which the studio's **Re-settle** runs again.
         """
+        self.settle_run = run
         settles = getattr(pipeline, "particle_settles", None)
         if settles is None:
             settles = pipeline.particle_settles = {"runs": set(), "things": []}

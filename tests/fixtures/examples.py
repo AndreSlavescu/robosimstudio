@@ -14,9 +14,13 @@ any process that runs both.
 (``examples/01_cloth/00_towel.py``), each of which runs alone. A numbered folder
 is not an importable package, so every example is loaded by file path -- which
 is also how a reader runs one (``uv run examples/01_cloth/00_towel.py``). The
-rope's numbered examples are in ``examples/03_rope/`` like every other kind's;
-:data:`ROPE` is the four older flat scripts under ``examples/scenes/``, in a
-tree that has them, and is empty in a tree that does not.
+rope's numbered examples are in ``examples/03_materials/``, a script a kind, like
+every other material's; :data:`ROPE` is the four older flat scripts under
+``examples/scenes/``, in a tree that has them, and is empty in a tree that does
+not. A scene a test drives that is not an example, one whose material already has
+its script in ``03_materials``, is under ``tests/scenes/``, named from the
+repository root (``tests/scenes/01_between_posts.py``) and loaded the same way;
+:data:`SCENES` lists them.
 
 Importing this module imports nothing of the library, so reading its tables
 needs no GPU; the library is loaded with the first example a test asks for.
@@ -33,14 +37,17 @@ from pathlib import Path
 
 __all__ = [
     "DEMOS",
+    "DEMO_ENGINES",
     "EXAMPLES",
     "HAS_ROPE",
     "NO_ROPE",
     "NUMBERED",
     "ROOT",
     "ROPE",
+    "SCENES",
     "SCRIPTS",
     "_load",
+    "_path",
     "_run",
     "_stub_studio",
 ]
@@ -51,10 +58,26 @@ EXAMPLES = ROOT / "examples"
 NUMBERED = (
     "01_cloth/00_towel.py",
     "01_cloth/02_engines.py",
+    "01_cloth/03_scrub_a_stain.py",
     "02_soft/01_tet_mesh.py",
+    "03_materials/00_rope.py",
+    "03_materials/01_rope_memory.py",
+    "03_materials/02_twist.py",
+    "03_materials/05_paper.py",
+    "03_materials/07_brush.py",
+    "03_materials/08_tape.py",
+    "03_materials/09_adhesion.py",
+    "03_materials/10_cutting.py",
+    "03_materials/11_granular.py",
+    "03_materials/12_liquid.py",
+    "03_materials/13_dough.py",
     "04_extending/01_new_kind.py",
-    "03_rope/00_cable.py",
-    "03_rope/01_between_posts.py",
+    "04_extending/02_suction.py",
+    "06_tasks/03_granular_scored.py",
+    "06_tasks/04_brush_scored.py",
+    "06_tasks/05_suction_scored.py",
+    "06_tasks/08_tape_scored.py",
+    "06_tasks/09_cutting_scored.py",
 )
 """The numbered scripts that run on a base checkout: no flags, every parameter a
 local, two arms, one call to the studio. ``02_engines`` is here because its one
@@ -72,12 +95,50 @@ then covers the numbered scripts alone."""
 
 SCRIPTS = (*NUMBERED, *ROPE)
 
-DEMOS = ("02_soft/00_sponge.py", "03_rope/02_superdex.py")
+DEMOS = (
+    "02_soft/00_sponge.py",
+    "03_materials/03_knot.py",
+    "03_materials/04_band.py",
+    "03_materials/06_bag.py",
+    "03_materials/14_water.py",
+    "06_tasks/06_bag_scored.py",
+    "06_tasks/07_band_scored.py",
+    "06_tasks/10_water_scored.py",
+)
 """The multi-engine demos, which the ones above cannot stand in for: each needs a
-foreign engine, and each is the *acceptance* scene for one kind on it. They are
-not in :data:`SCRIPTS` because none satisfies its rules on a base checkout --
-the sponge stands under a single-armed Panda where the scene scripts ship a
-bimanual robot, and the SuperDex cable needs the ``[superdex]`` extra to build."""
+foreign engine, and each is the *acceptance* scene for one kind or feature on it
+(the sponge, the bag's self-contacting shell, the rope's knot, the closed rod's
+band, the water). They are not in :data:`SCRIPTS` because none satisfies its
+rules on a base checkout -- the sponge stands under a single-armed Panda where
+the scene scripts ship a bimanual robot, the bag, knot and band need the
+``[superdex]`` extra to build, and the water the ``[genesis]`` one, which lives
+in a virtual environment of its own."""
+
+DEMO_ENGINES = {
+    "02_soft/00_sponge.py": "superdex",
+    "03_materials/03_knot.py": "superdex",
+    "03_materials/04_band.py": "superdex",
+    "03_materials/06_bag.py": "superdex",
+    "03_materials/14_water.py": "genesis",
+    "06_tasks/06_bag_scored.py": "superdex",
+    "06_tasks/07_band_scored.py": "superdex",
+    "06_tasks/10_water_scored.py": "genesis",
+    "tests/scenes/02_superdex.py": "superdex",
+}
+"""The foreign engine each demo is about, by its path: stated, not read off the file's name.
+``tests/scenes/02_superdex`` is no demo, but it is the rope's scene on SuperDex and held to that engine too."""
+
+SCENES = (
+    "tests/scenes/00_roll_dough.py",
+    "tests/scenes/01_between_posts.py",
+    "tests/scenes/01_box_flap.py",
+    "tests/scenes/01_wipe_spill.py",
+    "tests/scenes/02_superdex.py",
+)
+"""The scenes the tests drive that are not examples, named from the repository root.
+Not shipped, and still held to the scene scripts' shape: two arms, a handle on the
+robot, no command line, ``main()`` ending in ``rss.view``. ``02_superdex`` needs the
+``[superdex]`` extra to build, and :data:`DEMO_ENGINES` holds it to that engine."""
 
 HAS_ROPE = bool(ROPE)
 NO_ROPE = "the older rope scripts (examples/scenes/) are not in this tree"
@@ -102,6 +163,11 @@ def _stub_studio():
         rss.view = real
 
 
+def _path(rel: str) -> Path:
+    """An example's file from its path under ``examples/``, or a test scene's from the repository root."""
+    return ROOT / rel if rel.startswith("tests/") else EXAMPLES / rel
+
+
 @functools.cache
 def _load(rel: str):
     """One example as a module, loaded by file path, once.
@@ -114,7 +180,7 @@ def _load(rel: str):
     dataclass defined in the file needs to find its own module.
     """
     name = "_rss_example_" + re.sub(r"\W", "_", rel.removesuffix(".py"))
-    spec = importlib.util.spec_from_file_location(name, EXAMPLES / rel)
+    spec = importlib.util.spec_from_file_location(name, _path(rel))
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
@@ -126,5 +192,5 @@ def _run(rel: str):
     with _stub_studio() as opened:
         _load(rel).main()
     if len(opened) != 1:
-        raise AssertionError(f"examples/{rel} opened {len(opened)} pages, not one")
+        raise AssertionError(f"{_path(rel).relative_to(ROOT)} opened {len(opened)} pages, not one")
     return opened[0]

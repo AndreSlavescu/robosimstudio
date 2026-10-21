@@ -15,7 +15,6 @@ from dataclasses import dataclass, replace
 import newton
 import numpy as np
 import warp as wp
-from robosimstudio.domains.soft import FIRM_FOAM
 
 import robosimstudio as rss
 from robosimstudio.core.math import quat_to_mat
@@ -25,6 +24,7 @@ from robosimstudio.domains.capabilities import host_bridge
 from robosimstudio.domains.rigid import EntityRigid
 from robosimstudio.scene.entity import label_index
 from robosimstudio.specs import ActuationSpec
+from robosimstudio_materials.soft import FIRM_FOAM
 
 # =============================================================================
 # 1. The layout
@@ -182,8 +182,6 @@ class GrabBar(EntityRigid):
     def build(self, builder: newton.ModelBuilder, episode) -> None:
         super().build(builder, episode)
         spec = self.spec
-        # A static object is a jointless link, which MuJoCo's converter refuses: weld it to the world.
-        builder.add_joint_fixed(-1, self.body, parent_xform=builder.body_q[self.body], label=f"{spec.name}_weld")
         cfg, r, bend = self._contact_cfg(builder), float(spec.radius), float(spec.bend_radius)
         for end, sign in (("far", 1.0), ("near", -1.0)):
             centre = np.array([-bend, 0.0, sign * spec.half_len])  # the bend's centre of curvature

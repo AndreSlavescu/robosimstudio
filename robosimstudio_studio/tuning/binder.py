@@ -126,6 +126,8 @@ class SpecBinder:
         self.skip = frozenset(skip)
         self.pending: dict[str, Any] = {}
         """Edits made since the last :meth:`drain`, field name -> new value."""
+        self.refused = ""
+        """Why the last :meth:`drain` took nothing, when the spec refused its edits; empty otherwise."""
         self._widgets: dict[str, Any] = {}
         self._readouts: dict[str, Any] = {}
         self._ui: dict[str, ParamUI] = {}
@@ -182,13 +184,30 @@ class SpecBinder:
 
     # ------------------------------------------------------------------ drain
     def drain(self) -> dict[str, Any]:
-        """Take the pending edits, main thread. Empty when nothing moved."""
+        """Take the pending edits, main thread. Empty when nothing moved.
+
+        Edits the spec's own ``__post_init__`` refuses (a tape's ``reach`` dragged under its
+        ``peak_opening``) are not taken: the spec stays, the controls go back to it, :attr:`refused`
+        says why and nothing is returned, so a panel's drain carries on rather than ending the loop.
+        """
+        self.refused = ""
         if not self.pending:
             return {}
         taken, self.pending = self.pending, {}
-        self.spec = replace(self.spec, **taken)
+        try:
+            spec = replace(self.spec, **taken)
+        except ValueError as exc:
+            self.refuse(self.spec, f"{', '.join(taken)} not changed: {exc}")
+            return {}
+        self.spec = spec
         self._refresh_readouts(taken)
         return taken
+
+    def refuse(self, spec: Any, reason: str) -> None:
+        """Take back edits refused after :meth:`drain` took them, by what they were written to: the
+        controls go back to ``spec``, what was taken, and :attr:`refused` says why."""
+        self.refused = reason
+        self.set_spec(spec)
 
     def _refresh_readouts(self, changed: dict[str, Any]) -> None:
         for name, value in changed.items():
@@ -212,10 +231,24 @@ class SpecBinder:
         finally:
             self._syncing = False
 
-    def _sync_widgets(self, spec: Any) -> None:
+    def follow(self, spec: Any) -> None:
+        """Point every control at ``spec``, a change made on another panel, keeping the edits still pending.
+
+        Where :meth:`set_spec` drops them, which is right for a preset that replaces what they
+        described. One panel's edit to the same sheet as another's is not that: a control moved here
+        since the last :meth:`drain` keeps its value and its edit, which lands on ``spec``.
+        """
+        self.spec = spec
+        self._syncing = True
+        try:
+            self._sync_widgets(spec, skip=self.pending)
+        finally:
+            self._syncing = False
+
+    def _sync_widgets(self, spec: Any, skip: Iterable[str] = ()) -> None:
         for name, widget in self._widgets.items():
             value = getattr(spec, name, None)
-            if value is None:
+            if value is None or name in skip:
                 continue
             ui = self._ui[name]
             if ui.log and ui.range is not None and value > 0:
@@ -227,6 +260,16 @@ class SpecBinder:
             readout = self._readouts.get(name)
             if readout is not None:
                 readout.value = _fmt(value, ui)
+
+    def set_disabled(self, names: Iterable[str]) -> None:
+        """Show ``names`` read-only and every other control editable.
+
+        For a field with nothing in the entity to write to -- a slab's core on a membrane -- which a
+        slider would otherwise offer and then move nothing.
+        """
+        off = frozenset(names)
+        for name, widget in self._widgets.items():
+            widget.disabled = name in off
 
     @property
     def unset(self) -> tuple[str, ...]:

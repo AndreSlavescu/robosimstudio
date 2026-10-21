@@ -37,14 +37,16 @@ import numpy as np
 from robosimstudio.core.bus import Bus
 from robosimstudio.core.math import quat_to_mat, transform_matrix
 from robosimstudio.core.render.visual import shape_meshes
+from robosimstudio.core.streams import reading
 from robosimstudio.robots.embodiments import top_down_grasp_site_quat
+from robosimstudio.sim.sim import scene_deformables
 from robosimstudio.solvers import grasp_from_obb, top_down_grasp_quat
 from robosimstudio_bench.goals.goal import about_key, leaves, placements
 
 from .refusal import ToolRefusal
 from .types import quat_wxyz, se3_of_xform, vec3
 
-__all__ = ["GoalCursor", "register_goal_cursor", "register_sim_tools"]
+__all__ = ["GoalCursor", "Vacuum", "register_goal_cursor", "register_sim_tools", "register_vacuum"]
 
 
 def _grasp_heading_deg(long_axis_yaw: float) -> float:
@@ -79,6 +81,7 @@ def register_sim_tools(registry, env, bus: Bus) -> None:
         # than letting a second registration win silently.
         registry.register_callable(name, fn, summary=summary, tags=("privileged",))
     register_attachment(registry, env, bus)
+    register_vacuum(registry, env, bus)
 
 
 def register_attachment(registry, env, bus: Bus) -> ClothAttachment | None:
@@ -93,9 +96,9 @@ def register_attachment(registry, env, bus: Bus) -> ClothAttachment | None:
     tool that raises the first time a graph believes the registry.
 
     Returns the attachment so a suite registering further tools can share it,
-    or ``None`` when the scene has no deformables.
+    or ``None`` when the scene has no deformables (:func:`_deformables`).
     """
-    if not any(getattr(e, "carries_particles", False) for e in getattr(env.scene, "by_name", {}).values()):
+    if not _deformables(env):
         return None
     attachment = ClothAttachment(env, bus)
     registry.register_callable(
@@ -111,6 +114,103 @@ def register_attachment(registry, env, bus: Bus) -> ClothAttachment | None:
         tags=("privileged",),
     )
     return attachment
+
+
+def _deformables(env) -> dict[str, Any]:
+    """The scene's deformables, by :func:`~robosimstudio.sim.sim.scene_deformables`: what ``Sim.deformables`` answers.
+
+    Asked of the scene rather than of ``env``, which may be one world of a fleet (a
+    ``WorldView``, with no ``deformables``). Every tool here that lists, defaults or
+    looks one up goes through this, so registering ``sim.attach``, its default target
+    and ``get_particle_state`` agree on what a deformable is.
+    """
+    return scene_deformables(getattr(env, "scene", None))
+
+
+def _deformable(env, name: str) -> tuple[str, Any]:
+    """The deformable called ``name``, or the first one for ``""``; refused when there is none.
+
+    The refusal is ``get_rgbd``'s for a camera it does not have: the name asked for and the ones
+    there are. A name off the list -- a cuttable, a capsule-chain rope, a typo -- raised a bare
+    ``KeyError`` out of ``get_particle_state``, which a graph cannot route on.
+    """
+    deformables = _deformables(env)
+    if not deformables:
+        raise ToolRefusal("this scene has no deformables")
+    name = name or next(iter(deformables))
+    if name not in deformables:
+        raise ToolRefusal(f"no deformable {name!r}; have {sorted(deformables)}")
+    return name, deformables[name]
+
+
+def _probe(entity, env) -> Any:
+    """``entity``'s particle probe for the world ``env`` is: a fleet ``WorldView`` carries its ``world``, an ``Env`` is 0.
+
+    ``entity.probe`` alone is world 0's, so a graph driving world 3 of a wave read world 0's
+    particles back from ``get_particle_state`` -- a centroid, a height band, a footprint, all of
+    the wrong towel, with nothing to say so. Each probe-per-world thing opens one per world
+    (``ParticleMixin.bind``) and the fleet refreshes each one as it scores that world
+    (``FleetEnv._particles``); a thing holding one probe is kept out of a wave by
+    ``scoring_refusal``, and keeps its one here.
+    """
+    probe_for = getattr(entity, "probe_for", None)
+    return probe_for(int(getattr(env, "world", 0) or 0)) if callable(probe_for) else entity.probe
+
+
+def _model_state(env) -> Any:
+    """The whole model's state, which a probe reads: a fleet ``WorldView``'s ``state`` is its world's slice of it.
+
+    A probe holds every particle of the model it was opened on and addresses its world's by model
+    row, as :func:`_first_particle_row` maps them, so it is refreshed from the fleet's own state.
+    """
+    fleet = getattr(env, "fleet", None)
+    return fleet.pipeline.state_0 if fleet is not None else env.state
+
+
+def _particle_rows(env) -> slice | None:
+    """The model rows of the world ``env`` is, on a fleet's ``WorldView``; ``None`` (every row) for an ``Env``.
+
+    What a probe of that world reads (:func:`_probe`): its sets are in its world's block of the
+    fleet's model, which holds every world's particles.
+    """
+    fleet = getattr(env, "fleet", None)
+    return fleet.worlds.particles(int(getattr(env, "world", 0) or 0)) if fleet is not None else None
+
+
+def _first_particle_row(env) -> int:
+    """The model row of particle 0 of the world ``env`` is: 0 for an ``Env``, world ``w``'s first on a fleet's ``WorldView``.
+
+    The world is :func:`_probe`'s, the view's ``world``. A view's ``state.particle_q`` is its own
+    world's slice, indexed like the template, so a deformable's template indices read that world's
+    particles out of it; a pin runs on the fleet's whole state, where the same indices are world
+    0's rows. ``sim.attach`` on world 1 of a two-world granular wave seized eight of world 0's rice
+    grains and moved them 13 mm toward world 1's hand in one step.
+    """
+    world = int(getattr(env, "world", 0) or 0)
+    return env.fleet.worlds.particle(0, world) if world else 0
+
+
+def register_vacuum(registry, env, bus: Bus) -> Vacuum | None:
+    """Register ``sim.vacuum``, if the robot carries a suction hand.
+
+    Conditional on the robot for the reason :func:`register_attachment` is
+    conditional on the cell: "does this robot have a cup" is a fact about the
+    hardware, and a robot with jaws only gets no tool rather than one that
+    raises the first time a graph believes it.
+
+    Returns the tool, or ``None`` when no arm has a cup.
+    """
+    embodiment = getattr(getattr(env, "scene", None), "embodiment", None)
+    if not getattr(embodiment, "suctions", None):
+        return None
+    tool = Vacuum(env, bus)
+    registry.register_callable(
+        "sim.vacuum",
+        tool.vacuum,
+        summary="Switch a suction hand's vacuum on or off, and say whether it sealed and on what.",
+        tags=("privileged",),
+    )
+    return tool
 
 
 def register_goal_cursor(registry, env, bus: Bus) -> GoalCursor:
@@ -361,7 +461,8 @@ class SimTools:
         handle = self.env.handles.entity(object_name)
         if handle.obb is None:
             raise ToolRefusal(f"object {object_name!r} has no grasp box")
-        pose = handle.pose(self._body_q())
+        # By the body the box was fit on: a roller's is its handle, which stays upright while the drum it names rolls.
+        pose = np.asarray(self._body_q()[handle.obb.body], dtype=np.float64)
         rotation = quat_to_mat(pose[3:7])
         centre = pose[:3] + rotation @ handle.obb.center_local
         point, yaw = grasp_from_obb(handle.obb, pose, handle_frac)
@@ -463,13 +564,22 @@ class SimTools:
         }
 
     def get_particle_state(self, cloth: str = "", particle_set: str = "") -> dict[str, Any]:
-        deformables = {n: e for n, e in self.env.scene.by_name.items() if e.carries_particles}
-        if not deformables:
-            raise ToolRefusal("this scene has no deformables")
-        name = cloth or next(iter(deformables))
-        probe = deformables[name].probe
+        name, entity = _deformable(self.env, cloth)
+        probe = _probe(entity, self.env)
         key = f"{name}/{particle_set}" if particle_set else name
-        return {"cloth": name, "set": key, **self.bus.call(probe.summary, key)}
+
+        def read() -> dict[str, Any]:
+            # Refreshed from the state as it stands, every call: nothing refreshes a probe for a
+            # tool. A fleet refreshes world k's only as it scores that world, every eval_every
+            # steps, and a bare Sim's holds what snapshot_rest left, so the summary alone was the
+            # sheet where it lay at the last score. Only this world's rows, at this step, so that
+            # neither a fleet nor an env reads them again until it steps.
+            step = getattr(self.env, "step_count", None)
+            with reading():
+                probe.update(_model_state(self.env), step, rows=_particle_rows(self.env))
+            return probe.summary(key)
+
+        return {"cloth": name, "set": key, **self.bus.call(read)}
 
     def get_rgbd(self, camera: str = "") -> dict[str, Any]:
         frames = self.bus.snapshot.frames
@@ -562,7 +672,7 @@ class SimTools:
         handle = self.env.handles.entity(object_name)
         if handle.obb is None:
             raise ToolRefusal(f"object {object_name!r} has no bounding box")
-        pose = handle.pose(self._body_q())
+        pose = np.asarray(self._body_q()[handle.obb.body], dtype=np.float64)  # the box's own body, as above
         rotation = quat_to_mat(pose[3:7])
         half = np.asarray(handle.obb.half, dtype=np.float64)
         centre = np.asarray(pose[:3], dtype=np.float64) + rotation @ np.asarray(
@@ -978,8 +1088,11 @@ class ClothAttachment:
         """Seize a deformable's declared feature at one hand and carry it.
 
         Args:
-            entity: Which deformable. Empty takes the task's first, which is the
-                only one in every scene that ships today.
+            entity: Which deformable, of the ones ``get_particle_state`` lists
+                (:func:`_deformables`). Empty takes the first of them. It took the
+                task's first ``deformables``-stage spec, and a cuttable is staged
+                there: a tofu declared before a towel had the hand pin the eight
+                corners of its cage and report ``attached`` while it held nothing.
             arm: Which hand. Empty takes the work arm -- *not* the first arm
                 declared, since the two YAM cells list theirs in opposite orders
                 and declaration order names the idle hand on one of them.
@@ -1004,8 +1117,7 @@ class ClothAttachment:
             from robosimstudio.core.draggers import ParticleDragger
 
             env = self.env
-            name = entity or env.task.deformables[0].name
-            body = env.scene.by_name[name]
+            name, body = _deformable(env, entity)
             arm_name = arm or env.handles.work_arm or next(iter(env.handles.arms))
             if arm_name not in env.handles.arms:
                 raise ToolRefusal(f"no arm {arm_name!r}; have {sorted(env.handles.arms)}")
@@ -1030,7 +1142,16 @@ class ClothAttachment:
             self._sets[arm_name] = str(feature)
             candidates = body.set_indices(feature) if feature else body.particles
             position, quat = env.arm(arm_name).ee_pose(env.state)
-            seized = int(dragger.grab(env.state, position, quat, candidates=candidates, fallback_nearest=False))
+            seized = int(
+                dragger.grab(
+                    env.state,
+                    position,
+                    quat,
+                    candidates=candidates,
+                    fallback_nearest=False,
+                    first_row=_first_particle_row(env),
+                )
+            )
             return {
                 "attached": bool(seized),
                 "n_grabbed": seized,
@@ -1067,6 +1188,111 @@ class ClothAttachment:
                 continue
             position, quat = env.arm(arm_name).ee_pose(env.state)
             dragger.set_target(position, quat)
+
+
+class Vacuum:
+    """A suction hand's vacuum, switched by a graph: the rigid counterpart of :class:`ClothAttachment`.
+
+    The same :class:`~robosimstudio.core.suction.Suction` the page's
+    **Vacuum** box switches, so a graph and a person hold a plate the same way:
+    the cup seals onto the part under its face when the face is within 2 mm of
+    it and square to it within 15 degrees, and lets go when switched off.
+
+    **Privileged, though a vacuum is real hardware.** A real cup reports one
+    bit, its pressure switch, which is ``sealed``. The gap, the tilt and the
+    name of what it sealed on are read off the simulator, and the hold itself is
+    a weld or a spring rather than air. A graph that routes on ``sealed`` alone
+    is the part that would transfer.
+
+    Args:
+        env: The toolkit-layer environment.
+        bus: The bus whose owner thread every switch runs on.
+    """
+
+    def __init__(self, env, bus: Bus) -> None:
+        self.env = env
+        self.bus = bus
+
+    def vacuum(self, on: bool = True, arm: str = "", object_name: str = "", tier: str = "auto") -> dict[str, Any]:
+        """Switch one cup's vacuum on or off.
+
+        Args:
+            on: True seals onto the part under the face (or ``object_name``) and
+                holds it; False lets go.
+            arm: Which hand. Empty takes the first arm with a cup, *not* the
+                work arm: on ``yam_bimanual_suction`` the work arm is the left,
+                which has jaws.
+            object_name: The part to seal on. Empty takes whatever is under
+                the cup, which is what a real vacuum does.
+            tier: ``"auto"``, ``"weld"`` or ``"wrench"``; see
+                :meth:`~robosimstudio.core.suction.Suction.hold`.
+
+        Returns:
+            ``on``, ``sealed``, ``held`` (the part's name, or empty), ``gap_m``,
+            ``tilt_deg``, ``tier``, ``arm``, ``why``. A refusal is ``sealed``
+            false with the gap and tilt that refused it and ``why`` in a
+            sentence, which is what a graph routes on rather than lifting air.
+        """
+
+        def switch() -> dict[str, Any]:
+            suctions = self.env.scene.embodiment.suctions
+            name = arm or next(iter(suctions))
+            if name not in suctions:
+                raise ToolRefusal(f"no suction hand on arm {name!r}; the cups are on {sorted(suctions)}")
+            if tier not in ("auto", "weld", "wrench"):
+                raise ToolRefusal(f"tier must be 'auto', 'weld' or 'wrench', not {tier!r}")
+            cup = suctions[name]
+            if not on:
+                cup.release()
+                return {
+                    "on": False,
+                    "sealed": False,
+                    "held": "",
+                    "gap_m": float("nan"),
+                    "tilt_deg": float("nan"),
+                    "tier": "",
+                    "arm": name,
+                    "why": "",
+                }
+            body = None
+            if object_name:
+                entity = self.env.scene.by_name.get(object_name)
+                body = getattr(entity, "body", None)
+                if body is None or int(body) < 0:
+                    raise ToolRefusal(f"{object_name!r} is not a rigid body in this scene")
+            try:
+                report = cup.hold(body, tier=tier)
+            except RuntimeError as error:
+                raise ToolRefusal(str(error)) from error
+            return {
+                "on": True,
+                "sealed": bool(report.sealed),
+                "held": self._name_of(cup),
+                "gap_m": float(report.gap_m),
+                "tilt_deg": float(np.degrees(report.tilt_rad)),
+                "tier": cup.tier,
+                "arm": name,
+                "why": report.why,
+            }
+
+        return self.bus.call(switch)
+
+    def _name_of(self, cup) -> str:
+        """The held part's entity, by the cup's own map of who built each part it can seal on.
+
+        By an entity's :attr:`body` alone, a cup sealed on a roller's handle or a
+        brush's strip held "": neither is the body its entity's pose places. A
+        part named to :meth:`vacuum` is that body, so it is the fallback.
+        """
+        body = cup.held
+        if body < 0:
+            return ""
+        if int(body) in cup.owners:
+            return cup.owners[int(body)]
+        for name, entity in self.env.scene.by_name.items():
+            if getattr(entity, "body", None) == body:
+                return name
+        return ""
 
 
 class GoalCursor:

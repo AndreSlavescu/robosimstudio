@@ -35,7 +35,9 @@ from __future__ import annotations
 
 import logging
 import pathlib
+import shutil
 import tempfile
+import weakref
 from typing import Any
 
 import numpy as np
@@ -55,7 +57,16 @@ from robosimstudio.engines.pose import compose, quat_rotate
 
 from .runtime import ensure_initialized
 
-__all__ = ["CLOTH_MASS_FACTOR", "GenesisBridge", "cloth_density", "mirror_role", "wxyz"]
+__all__ = [
+    "CLOTH_MASS_FACTOR",
+    "LEGACY_KINDS",
+    "GenesisBridge",
+    "cloth_density",
+    "coupler_for",
+    "mirror_role",
+    "write_obj",
+    "wxyz",
+]
 
 log = logging.getLogger(__name__)
 
@@ -76,10 +87,75 @@ surfaces the full ``rho * thickness``) rather than an artefact.
 It has to be divided out, and that is a correctness matter rather than a tuning
 one: the Newton model and the Genesis model must agree on what the cloth weighs,
 or the wrench fed back to the arm is twice what it should be and the cloth's own
-dynamics are not the scene's. The division is checked at build --- see
-:meth:`GenesisBridge._verify_mass` --- because a factor that changes upstream
-would otherwise read as "the cloth feels heavy" for a week.
+dynamics are not the scene's. What a sheet is handed is checked against the
+Newton model before the engine is asked for (:meth:`GenesisBridge._check_mass`);
+that Genesis still masses it this way is checked by weighing
+(``tests/test_genesis.py``, 1.000 of the sheet's weight, 2.0 without the
+division), because genesis-world 1.3.3's ``FEMEntity`` carries no mass to read
+at build (``g1_mass.py``), and a factor that changes upstream would otherwise
+read as "the cloth feels heavy" for a week.
 """
+
+
+LEGACY_KINDS = frozenset({"sph"})
+"""Actor kinds only Genesis's legacy coupler steps; every other kind here is the IPC coupler's.
+
+A Genesis scene holds one coupler, so an island is one or the other: see
+:func:`coupler_for` and :mod:`robosimstudio.engines.genesis.sph`."""
+
+
+def coupler_for(recipe: dict) -> str:
+    """``"legacy"`` or ``"ipc"``: the coupler an island's actors need, or a refusal naming the mix.
+
+    Raises:
+        ValueError: when the island holds a legacy kind (a liquid) beside an IPC
+            one (a cloth or a soft body). Genesis builds one coupler per scene, and
+            an SPH body under the IPC coupler does not compile
+            (:mod:`robosimstudio.engines.genesis.sph`); route one of them to
+            another backend, or to a second ``genesis`` backend with other
+            parameters, which is a second island.
+    """
+    kinds = {str(a.get("kind", "tet")): str(a.get("name", "")) for a in recipe.get("actors", ())}
+    legacy = sorted(k for k in kinds if k in LEGACY_KINDS)
+    ipc = sorted(k for k in kinds if k not in LEGACY_KINDS)
+    if legacy and ipc:
+        raise ValueError(
+            f"genesis island {recipe.get('island')!r} holds {legacy} actors, which only Genesis's legacy coupler "
+            f"steps, beside {ipc} actors, which only its IPC coupler does, and a Genesis scene has one coupler. "
+            "Route the liquid and the cloth or soft body to different backends: a second "
+            "backend('genesis', ...) with other parameters is a second island."
+        )
+    return "legacy" if legacy else "ipc"
+
+
+def write_obj(bridge: Any, geom: ShapeGeometry, mesh) -> str:
+    """A tessellated mirror as an ``.obj`` in a directory of ``bridge``'s own; its path.
+
+    A file rather than a ``MeshSet`` because that in-memory path is verified only
+    for the FEM entity; a rigid morph reading one is not. Mirrors are built once,
+    so the write is not on any hot path. The name carries the shape index and
+    nothing about the project, since a repro bundle's leak scan reads paths.
+
+    The directory is the bridge's, made on its first mirror and removed when the
+    bridge is collected or the process exits, rather than one fixed path under
+    the temp dir: two processes building an island of the same name (sharded
+    tests, two live pages) wrote the same ``mirror-<shape>.obj``, and in a probe
+    of two writers each reading its own back, 221 of 300 reads came back with
+    the other's mesh or half of one.
+    """
+    verts, faces = mesh
+    root = getattr(bridge, "_mirror_root", None)
+    if root is None:
+        root = tempfile.mkdtemp(prefix=f"rss-genesis-{bridge.recipe.get('island', 'host')}-")
+        weakref.finalize(bridge, shutil.rmtree, root, ignore_errors=True)
+        bridge._mirror_root = root
+    path = pathlib.Path(root) / f"mirror-{geom.shape}.obj"
+    with path.open("w") as handle:
+        for v in verts:
+            handle.write(f"v {v[0]:.9g} {v[1]:.9g} {v[2]:.9g}\n")
+        for f in faces:
+            handle.write(f"f {f[0] + 1} {f[1] + 1} {f[2] + 1}\n")
+    return str(path)
 
 
 def wxyz(q_xyzw) -> np.ndarray:
@@ -132,12 +208,38 @@ class GenesisBridge:
         feedback: str = "auto",
         pose_source: str = "fresh",
     ) -> None:
-        gs = ensure_initialized(precision)
-        self.gs = gs
+        if coupler_for(recipe) != "ipc":
+            raise ValueError(
+                f"genesis island {recipe.get('island')!r} holds a liquid, which this IPC bridge does not step; "
+                "robosimstudio.engines.genesis.sph.SphBridge does (SolverGenesis picks it from the actors)"
+            )
         self.model = model
         self.recipe = dict(recipe)
         self.substeps = max(1, int(substeps))
         self.feedback = str(feedback)
+        # Every refusal the model and the recipe can make, before the engine is asked for: gs.init runs once a
+        # process, so an island refused after it still set the precision every later island gets. Refused after it,
+        # a sheet started inside the bench left a water island built next in the process at float64, which the
+        # runtime warns is 8x slower a substep (g1_order.py). The mass check is one of them: it reads what each
+        # sheet is handed, which Genesis's own entity does not say.
+        records = list(recipe.get("actors", ()))
+        builds = []
+        for record in records:
+            kind = str(record.get("kind", "tet"))
+            build = actor_builder("genesis", kind)
+            if build is None:
+                raise ValueError(
+                    f"genesis cannot build a {kind!r} actor ({record.get('name')!r}); it builds "
+                    f"{builders_for('genesis')}. The door for a new kind on this engine is "
+                    "engines.geometry.register_actor_builder('genesis', kind, build)."
+                )
+            builds.append(build)
+        geoms = [actor_geometry(model, record) for record in records]
+        shapes = iter_mirrors(model, recipe.get("mirrors", ()))
+        self._check_initial_clearance(geoms, shapes)
+        self._check_mass(geoms)
+        gs = ensure_initialized(precision)
+        self.gs = gs
 
         control_hz = float(recipe.get("control_hz", 60.0))
         self.scene = gs.Scene(
@@ -160,16 +262,14 @@ class GenesisBridge:
             show_viewer=False,
         )
 
-        self.actors: list[dict] = [self._add_actor(r) for r in recipe.get("actors", ())]
+        self.actors: list[dict] = [self._add_actor(geom, build) for geom, build in zip(geoms, builds, strict=True)]
         self.mirrors: list[dict] = []
-        for geom in iter_mirrors(model, recipe.get("mirrors", ())):
+        for geom in shapes:
             entry = self._add_mirror(geom)
             if entry is not None:
                 self.mirrors.append(entry)
 
-        self._check_initial_clearance()
         self.scene.build()
-        self._verify_mass()
         self._link_of = {int(m["entity"].base_link.idx): m for m in self.mirrors}
         self._entity_by_shape = {m["geom"].shape: m["entity"] for m in self.mirrors}
         self._rest_frame: int | None = None
@@ -198,21 +298,15 @@ class GenesisBridge:
         )
 
     # ----------------------------------------------------------------- build
-    def _add_actor(self, record: dict) -> dict:
+    def _add_actor(self, geom: Any, build: Any) -> dict:
         """One deformable, from the shared reader into a Genesis FEM entity.
 
-        The builder is looked up by kind -- the same registry SuperDex reads --
-        so a kind this engine has never been given is refused by name rather
-        than falling into somebody else's branch.
+        ``build`` is the builder registered for its kind -- the same registry
+        SuperDex reads -- looked up in ``__init__``, where a kind this engine has
+        never been given is refused by name before the engine is asked for,
+        rather than falling into somebody else's branch.
         """
         gs = self.gs
-        geom = actor_geometry(self.model, record)
-        build = actor_builder("genesis", geom.kind)
-        if build is None:
-            raise ValueError(
-                f"genesis cannot build a {geom.kind!r} actor ({geom.name!r}); it builds {builders_for('genesis')}. "
-                "The door for a new kind on this engine is engines.geometry.register_actor_builder('genesis', kind, build)."
-            )
         mesh, material = build(self, geom)
         # ``MeshSet`` is the in-memory path: a plain ``Mesh(file=<Trimesh>)``
         # falls through Genesis's morph dispatch and never reaches the loader.
@@ -299,26 +393,10 @@ class GenesisBridge:
         return np.asarray(self.model.body_q.numpy()[int(body)], dtype=np.float64)
 
     def _cache_obj(self, geom: ShapeGeometry, mesh) -> str:
-        """A tessellated mirror as an ``.obj`` under this island's workspace.
+        """A tessellated mirror as an ``.obj``: :func:`write_obj` in this bridge's own directory."""
+        return write_obj(self, geom, mesh)
 
-        A file rather than a ``MeshSet`` because that in-memory path is verified
-        only for the FEM entity; a rigid morph reading one is not. Mirrors are
-        built once, so the write is not on any hot path. The name carries the
-        shape index and nothing about the project, since a repro bundle's leak
-        scan reads paths.
-        """
-        verts, faces = mesh
-        root = pathlib.Path(tempfile.gettempdir()) / "rss-genesis" / str(self.recipe.get("island", "host"))
-        root.mkdir(parents=True, exist_ok=True)
-        path = root / f"mirror-{geom.shape}.obj"
-        with path.open("w") as handle:
-            for v in verts:
-                handle.write(f"v {v[0]:.9g} {v[1]:.9g} {v[2]:.9g}\n")
-            for f in faces:
-                handle.write(f"f {f[0] + 1} {f[1] + 1} {f[2] + 1}\n")
-        return str(path)
-
-    def _check_initial_clearance(self) -> None:
+    def _check_initial_clearance(self, geoms: list, shapes: list[ShapeGeometry]) -> None:
         """Refuse a scene whose actors start inside a mirror, and say which.
 
         **IPC's barrier is undefined through an intersection**, so libuipc
@@ -335,13 +413,12 @@ class GenesisBridge:
         geometry and asks a human to look, which is a far better failure than
         the one it replaces. Non-box mirrors are skipped rather than
         approximated, so this is a net that catches the common case and never
-        pretends to catch every case.
+        pretends to catch every case. It reads the actors' and the mirrors'
+        geometry off the Newton model alone, so it runs before ``gs.init``.
         """
-        for entry in self.actors:
-            geom = entry["geom"]
+        for geom in geoms:
             lo, hi = geom.rest.min(axis=0), geom.rest.max(axis=0)
-            for mirror in self.mirrors:
-                m = mirror["geom"]
+            for m in shapes:
                 if m.kind != "box" or m.moving:
                     continue
                 # The world AABB of the *rotated* box: half-extents |R| @ scale.
@@ -359,44 +436,94 @@ class GenesisBridge:
                         "intersection-free initial state; move one clear of the other."
                     )
 
-    def _verify_mass(self) -> None:
-        """Genesis's simulated cloth mass against Newton's, at build.
+    def _check_mass(self, geoms: list) -> None:
+        """Refuse a sheet Genesis would weigh other than the Newton model does, more than 10 % either way.
 
-        :data:`CLOTH_MASS_FACTOR` is divided out on the way in; this checks it
-        landed. A silent factor here is the difference between an arm feeling a
-        towel and an arm feeling two towels, and neither reads as an error.
+        A silent factor here is the difference between an arm feeling a towel
+        and an arm feeling two towels, and neither reads as an error: the band
+        is for a factor, not for a figure, since a sheet built as stated weighs
+        the same on both to float32 (12.0 g on both for the 200 mm towel of
+        ``tests/test_genesis.py``) and a dropped or doubled
+        :data:`CLOTH_MASS_FACTOR` is 2.0 or 0.5.
+
+        It reads what :func:`_build_shell` hands Genesis, ``rho`` and the
+        thickness over the sheet's triangles, times the factor ``FEM.Cloth``
+        masses by, off the recipe and the model, so it runs before ``gs.init``.
+        It once read the mass off Genesis's built entity, and never fired:
+        genesis-world 1.3.3's ``FEMEntity`` has no mass attribute
+        (``g1_mass.py``), so a sheet whose record stated twice the areal density
+        Newton built it at reached the engine with a warning. What this cannot
+        see, Genesis changing the factor, the weighing in ``tests/test_genesis.py``
+        does.
+
+        Only the particles Newton gives mass are weighed, on both sides. A held
+        cloth's held particles and a pinned paper's pinned ones are massless on
+        Newton, its kinematic particle (``EntityHeldCloth`` and ``EntityPaper``'s
+        ``apply_model_materials``), and Genesis is handed the whole sheet: weighed
+        whole against Newton's sum, a 200 mm towel held by one edge row of its 121
+        particles read 1.100 and a 120 x 130 mm board pinned by two of its 14 rows
+        1.167, both refused with a correct record (``r1_probe.py``). The area those
+        particles hold is apportioned as Newton's builder masses them, which the
+        actor's record states (its ``lumping``, :func:`_weighed_share`): told
+        apart by whether the weighed particles weigh alike, an 11 x 11 mesh sheet
+        massless around its rim was counted 81/121 of its area where it holds
+        81/100, and a record stating its built density read 0.826, refused. A
+        record that does not say how, over a sheet Newton weighs only in part,
+        is not weighed at all, and a warning says so, once an actor a build: the
+        composer's default for an entity declaring no actor states none, as does
+        a record replayed from before records stated it. Said at debug, the check
+        went quiet for each of them with nothing in the log.
+
+        A volume is not compared. ``FEM.Elastic`` masses it at ``rho * volume``
+        of the lattice it is handed: a 100 x 70 x 35 mm sponge at 110 kg/m^3
+        pressed 0.26438 N on a plate, its ``rho * V * g`` to five figures
+        (``g2_tet_weigh.py``). Newton's ``add_soft_grid`` gives each node a
+        whole cell's mass, so the same sponge's 90 nodes over 40 cells hold
+        60.6 g to its 26.95, and a comparison would refuse every lattice sponge
+        for Newton's lumping.
         """
         newton_mass = self.model.particle_mass.numpy()
-        for entry in self.actors:
-            geom = entry["geom"]
-            want = float(newton_mass[geom.start : geom.start + geom.count].sum())
-            got = _entity_mass(entry["entity"])
-            if got is None:
-                # Say so rather than pass quietly. This Genesis build exposes no
-                # simulated mass on an FEM entity -- the FEM solver's own
-                # ``elements_v_info.mass`` is a placeholder (1.0 per vertex) and
-                # the real figure lives inside libuipc, unreachable from here.
-                # So CLOTH_MASS_FACTOR is applied and *not* confirmed against
-                # this scene, and a silent pass would read exactly like a
-                # confirmed one. The factor itself is measured and pinned by
-                # tests/test_genesis_absent.py; what is unverified is whether
-                # this version still agrees with the measurement.
-                log.warning(
-                    "genesis actor %r: this build exposes no simulated mass, so the x%.1f cloth-mass "
-                    "convention is applied unverified. Newton says %.1f g. If the arm feels a cloth "
-                    "of the wrong weight, re-measure CLOTH_MASS_FACTOR against this Genesis version.",
-                    geom.name,
-                    CLOTH_MASS_FACTOR,
-                    want * 1e3,
-                )
+        for geom in geoms:
+            if geom.kind != "shell":
                 continue
+            masses = np.asarray(newton_mass[geom.start : geom.start + geom.count], dtype=np.float64)
+            weighed = masses > 0.0
+            want = float(masses[weighed].sum())
             if want <= 0.0:
                 continue
+            cloth = _cloth_args(self.recipe, geom.params)
+            a, b, c = (geom.rest[geom.tris[:, i]] for i in range(3))
+            areas = 0.5 * np.linalg.norm(np.cross(b - a, c - a), axis=1)
+            # The area the particles Newton weighs hold, so both sides are the same particles.
+            share = _weighed_share(masses, geom.tris, areas, geom.lumping)
+            if share is None:
+                log.warning(
+                    "genesis actor %r: not weighed; Newton weighs %d of its %d particles and its record states "
+                    "no lumping (%r), so the area they hold is not known",
+                    geom.name,
+                    int(weighed.sum()),
+                    len(masses),
+                    geom.lumping,
+                )
+                continue
+            area = float(areas.sum()) * share
+            got = CLOTH_MASS_FACTOR * cloth["rho"] * cloth["thickness"] * area
             if abs(got - want) > 0.1 * want:
+                over = (
+                    "" if weighed.all() else f" over the {int(weighed.sum())} of its {len(masses)} particles it weighs"
+                )
+                if area > 0.0:
+                    density = (
+                        f"its record's areal density, {got / area:.4g} kg/m^2 over its {area:.4g} m^2, is not the "
+                        f"{want / area:.4g} Newton built it at"
+                    )
+                else:
+                    # A ratio would divide by zero: no triangle's area is lumped onto a weighed particle.
+                    density = "the particles Newton weighs hold none of its triangles' area, so no record weighs them"
                 raise ValueError(
-                    f"genesis actor {geom.name!r} simulates {got * 1e3:.1f} g where the Newton model "
-                    f"says {want * 1e3:.1f} g (ratio {got / want:.3f}). CLOTH_MASS_FACTOR is "
-                    f"{CLOTH_MASS_FACTOR}; re-measure it against this Genesis version."
+                    f"genesis actor {geom.name!r} would weigh {got * 1e3:.1f} g on Genesis where the Newton model "
+                    f"says {want * 1e3:.1f} g{over} (ratio {got / want:.3f}): {density}. State the areal_density "
+                    "and thickness the sheet was built with in its actor params."
                 )
 
     # ------------------------------------------------------------------ tick
@@ -502,38 +629,55 @@ def _surface_of(tets: np.ndarray) -> np.ndarray:
     return faces[index[counts == 1]]
 
 
-def _entity_mass(entity) -> float | None:
-    """An FEM entity's simulated mass, if this Genesis version exposes one."""
-    for attr in ("mass", "total_mass", "_mass"):
-        value = getattr(entity, attr, None)
-        if value is not None:
-            try:
-                return float(np.asarray(value).sum())
-            except (TypeError, ValueError):
-                continue
-    return None
+def _weighed_share(masses: np.ndarray, tris: np.ndarray, areas: np.ndarray, lumping: str | None) -> float | None:
+    """The share of a sheet's area its particles with mass hold, apportioned as Newton's builder massed them.
+
+    1 when every particle has mass, whatever the builder. Otherwise by ``lumping``, the record's statement
+    of the builder: ``"grid"``, ``add_cloth_grid``, gives every particle one mass, so each holds an equal
+    share; ``"mesh"``, ``add_cloth_mesh``, gives each a third of its triangles' mass, so each holds a third
+    of their area. ``None``, or a builder not named here, where some particle is massless: the masses
+    cannot tell the two apart, since a regular mesh's weighed particles can weigh alike, so this does not
+    guess. ``tris`` index the sheet's own particles and ``areas`` are theirs [m^2].
+    """
+    weighed = masses > 0.0
+    if weighed.all():
+        return 1.0
+    if lumping == "grid":
+        return float(weighed.mean())
+    if lumping != "mesh":
+        return None
+    lumped = np.bincount(np.asarray(tris).ravel(), weights=np.repeat(areas / 3.0, 3), minlength=len(masses))
+    total = float(lumped.sum())
+    return float(lumped[weighed].sum() / total) if total > 0.0 else 0.0
 
 
-def _build_shell(bridge: GenesisBridge, geom: Any) -> tuple[Any, Any]:
-    """A membrane: a triangle mesh and Genesis's cloth material."""
-    import trimesh
+def _cloth_args(recipe: dict, params: dict) -> dict[str, float]:
+    """What ``FEM.Cloth`` is handed for one sheet: its record's params over the island's, then the defaults.
 
-    gs, params = bridge.gs, geom.params
-    mesh = trimesh.Trimesh(vertices=geom.rest, faces=geom.tris, process=False)
+    One reading for :func:`_build_shell` and :meth:`GenesisBridge._check_mass`, so the mass checked
+    before the engine is the mass the engine is given.
+    """
     thickness = float(params.get("thickness", 0.002))
     # This sheet's own moduli first, the island's only as the fallback -- the
     # same order ``SuperdexBridge`` reads them in. It was the recipe alone
     # here, so a fabric that stated ``shell_young`` got it on one engine and
     # silently did not on the other, and two sheets of different cloth in one
     # Genesis island were identically stiff.
-    material = gs.materials.FEM.Cloth(
-        E=float(params.get("young", bridge.recipe.get("shell_young", 1.0e5))),
-        nu=float(params.get("poisson", bridge.recipe.get("shell_poisson", 0.3))),
-        rho=cloth_density(float(params.get("areal_density", 0.3)), thickness),
-        thickness=thickness,
-        bending_stiffness=float(bridge.recipe.get("bending_stiffness", 10.0)),
-    )
-    return mesh, material
+    return {
+        "E": float(params.get("young", recipe.get("shell_young", 1.0e5))),
+        "nu": float(params.get("poisson", recipe.get("shell_poisson", 0.3))),
+        "rho": cloth_density(float(params.get("areal_density", 0.3)), thickness),
+        "thickness": thickness,
+        "bending_stiffness": float(recipe.get("bending_stiffness", 10.0)),
+    }
+
+
+def _build_shell(bridge: GenesisBridge, geom: Any) -> tuple[Any, Any]:
+    """A membrane: a triangle mesh and Genesis's cloth material."""
+    import trimesh
+
+    mesh = trimesh.Trimesh(vertices=geom.rest, faces=geom.tris, process=False)
+    return mesh, bridge.gs.materials.FEM.Cloth(**_cloth_args(bridge.recipe, geom.params))
 
 
 def _build_tet(bridge: GenesisBridge, geom: Any) -> tuple[Any, Any]:

@@ -95,7 +95,7 @@ def ensure_initialized(threads: int = -1):
         raise ImportError(
             "the 'superdex' backend needs the superdex-physics wheel: install the [superdex] extra "
             "(uv sync --extra superdex), or [cpu] on a machine without a GPU, where SuperDex serves every "
-            "cloth, rope and soft body (pip install 'robosimstudio[cpu]'). It ships for Python 3.12 only."
+            "cloth, bag, rope and soft body (pip install 'robosimstudio[cpu]'). It ships for Python 3.12 only."
         ) from error
     if not physics.is_initialized():
         physics.initialize(num_worker_threads=int(threads))
@@ -129,7 +129,14 @@ def _root_matrix(actor) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _root_reader(actor):
-    """Node positions in the scene's world frame for an actor whose root moves (a skinned soft body)."""
+    """Node positions in the scene's world frame through an actor's root as it stands.
+
+    A shell's root is its centroid (:meth:`SuperdexBridge.build_shell`); a skinned soft body's moves.
+    Read at every call, a shell's too, though nothing moves it now: held from the build, the
+    ``01_cloth/02_engines`` towel's read went from 13 to 5.6 us a control step, where the tick's
+    2.1-2.3 ms and the control step's 6.6-6.9 ms are inside their run-to-run spread either way
+    (``c4_root.py``, five runs each, GPU 6), and a root moved later would have read stale.
+    """
 
     def read() -> np.ndarray:
         rot, t = _root_matrix(actor)
@@ -137,6 +144,20 @@ def _root_reader(actor):
         return local @ rot.T + t
 
     return read
+
+
+def _named(enum: Any, name: str, option: str) -> Any:
+    """The member of one of the engine's enums that ``name`` spells, in any case.
+
+    An unknown name is refused with the names there are, not a bare
+    ``AttributeError`` from deep inside the build. ``COUNT`` is the enum's own
+    sentinel, not an option.
+    """
+    members = {key: value for key, value in enum.__members__.items() if key != "COUNT"}
+    member = members.get(str(name).upper())
+    if member is None:
+        raise ValueError(f"superdex {option} {name!r} is not one of {', '.join(k.lower() for k in members)}")
+    return member
 
 
 def _contact_params(physics, params: dict, *, penalty: float, friction: float, padding: float) -> Any:
@@ -235,6 +256,8 @@ class SuperdexBridge:
             mirror, which the engine adds only against a point-cloud actor (a
             rod). 0 keeps the engine's own. See :func:`build_mirror_actors`.
         mirror_exact_boxes: Mirror boxes as exact ``BOX`` colliders, not SDFs.
+        integration: The engine's time integrator by name (``"bdf2"``...), or
+            ``None`` for its backward Euler. See ``SolverSuperdex.open``.
 
     **Actor builders.** Each recipe actor is built by whatever
     :func:`~robosimstudio.engines.geometry.register_actor_builder` holds for
@@ -247,8 +270,9 @@ class SuperdexBridge:
     ``count`` and ``prev`` (the rest positions, in the engine's precision) --
     and may use what the bridge offers every builder: :attr:`physics`,
     :attr:`model`, :attr:`recipe`, :meth:`scene_of`, :meth:`actor_root`,
-    :meth:`contact_params`, and :attr:`actors`, the entries built before it
-    (each stamped with its ``entity`` and ``world``).
+    :meth:`root_reader`, :meth:`contact_params`, :meth:`build_shell` (the shell
+    builder, under a kind's own defaults), and :attr:`actors`, the entries built
+    before it (each stamped with its ``entity`` and ``world``).
 
     **One scene per world.** A replicated model superimposes its worlds at the
     origin, which is right for Newton -- its broadphase pairs within a world --
@@ -291,6 +315,7 @@ class SuperdexBridge:
         preconditioner: str | None = None,
         newton_iterations: int | None = None,
         linear_iterations: int | None = None,
+        integration: str | None = None,
     ) -> None:
         physics = ensure_initialized(threads)
         self.physics = physics
@@ -316,7 +341,7 @@ class SuperdexBridge:
         for world in range(self.num_worlds):
             scene = physics.create_scene(f"rss:{island}" if self.num_worlds == 1 else f"rss:{island}#w{world}")
             scene.set_gravity(gravity)
-            self._tune_solver(scene, linear_solver, preconditioner, newton_iterations, linear_iterations)
+            self._tune_solver(scene, linear_solver, preconditioner, newton_iterations, linear_iterations, integration)
             self.scenes.append(scene)
         # One lane per world at tick time: a world's mirrors are posed and its
         # scene stepped on a thread of its own. Both calls release the GIL, and
@@ -444,8 +469,9 @@ class SuperdexBridge:
         preconditioner: str | None,
         iterations: int | None,
         linear_iterations: int | None = None,
+        integration: str | None = None,
     ) -> None:
-        """The engine's linear solve, by name, or its own choice where ``None``.
+        """The engine's linear solve and time integrator, by name, or its own choice where ``None``.
 
         The engine picks ``AUTO`` with a per-actor preconditioner, which is
         right for foam. Against stiff polymer (E ~ 1e8-1e9) under 1e10 penalties
@@ -454,14 +480,16 @@ class SuperdexBridge:
         at the default, 145 ms at ``CG`` + ``BLOCK_JACOBI``, 179 ms at
         ``MINRES``, and 8.1 s at the sparse direct ``LDLT``.
         """
-        if linear is None and preconditioner is None and iterations is None and linear_iterations is None:
+        if all(v is None for v in (linear, preconditioner, iterations, linear_iterations, integration)):
             return
         params = scene.get_solver_params()
+        if integration is not None:
+            params.integration_method = _named(self.physics.IntegrationMethod, integration, "integration")
         if linear is not None:
-            params.linear_solver.solver_type = getattr(self.physics.LinearSolverType, str(linear).upper())
+            params.linear_solver.solver_type = _named(self.physics.LinearSolverType, linear, "linear_solver")
         if preconditioner is not None:
-            params.linear_solver.preconditioner_type = getattr(
-                self.physics.PreconditionerType, str(preconditioner).upper()
+            params.linear_solver.preconditioner_type = _named(
+                self.physics.PreconditionerType, preconditioner, "preconditioner"
             )
         if iterations is not None:
             params.non_linear_solver.max_iter = int(iterations)
@@ -683,14 +711,26 @@ class SuperdexBridge:
         return self.scenes[int(world) % self.num_worlds]
 
     def actor_root(self, record: dict) -> Any:
-        """Where this record's actor sits in its scene: identity, always.
+        """Where a soft body or a rod sits in its scene: identity.
 
-        Every world has its own scene, so an actor keeps its own rest
+        Every world has its own scene, so such an actor keeps its own rest
         coordinates and node positions read back *local* mean the Newton world
-        frame -- there is nothing to translate on the way in or out.
+        frame -- there is nothing to translate on the way in or out. A shell
+        does not sit here: :meth:`build_shell` roots every sheet and bag at its
+        centroid and reads through it, and :meth:`place_actor` writes through
+        whichever root an actor has.
         """
         del record
         return self.physics.TransformRT()
+
+    def root_reader(self, actor: Any) -> Any:
+        """A ``read`` for an actor's entry: its nodes in the world, through its root as it stands.
+
+        The method form of the module's own reader, the rule :meth:`place_actor`
+        writes by, so a builder outside this bundle that sets another root reads
+        back the way a placement is written, as :meth:`build_shell` does.
+        """
+        return _root_reader(actor)
 
     def contact_params(self, params: dict, *, penalty: float, friction: float, padding: float) -> Any:
         """One actor's engine ``ContactParams`` from its host params; see :func:`_contact_params`.
@@ -701,19 +741,58 @@ class SuperdexBridge:
         """
         return _contact_params(self.physics, params, penalty=penalty, friction=friction, padding=padding)
 
-    def _build_shell_actor(self, record: dict, particle_q: np.ndarray, tet_indices=None, tet_materials=None) -> dict:
-        """A membrane sheet as a SuperDex shell actor.
+    def build_shell(self, record: dict, *, defaults: dict | None = None) -> dict:
+        """A membrane as a SuperDex shell actor in a frame at its own centroid: the one shell builder.
 
-        Triangles come off the model exactly as the render path reads them;
-        elastic moduli are the island's (``shell_young``/``shell_poisson`` on
-        the backend -- cloth specs speak VBD stiffnesses, not Young/Poisson),
-        converted by the engine's own helper into thickness-integrated shell
-        stiffness plus an areal density.
+        Triangles come off the model exactly as the render path reads them. The
+        modulus is the sheet's own ``young``/``poisson`` when it states them, the
+        island's ``shell_young``/``shell_poisson`` otherwise (cloth specs speak
+        VBD stiffnesses, not Young/Poisson), converted by the engine's own
+        helper into thickness-integrated shell stiffness plus an areal density.
+
+        **The frame.** The engine is float32 and solves in the coordinates it
+        is given, so the rest layout goes in about its centroid, the centroid
+        is the root transform, and the nodes read back through the root
+        (:meth:`root_reader`), the rule :meth:`place_actor` writes by. A bag
+        built in bench-height world coordinates never converged, 24 ms an engine
+        step against 1.6 ms about its centroid (``robosimstudio_materials.bag``,
+        section 1). A flat sheet pays far less for the world frame: the
+        ``01_cloth/02_engines`` towel on SuperDex (0.3 m, 20 x 20 cells, the
+        YAM beside it) steps in 6.7 ms a control step at rest either way, where
+        both frames converge in no Newton iteration, and in its first second,
+        falling onto the bench, 0.57 iterations an engine step became 0.40 and
+        the steps that converged 97 per cent instead of 80 (``p2_cloth.py``,
+        GPU 6). Draped over a 10 cm cube on the engine alone, at rest: 3.4-3.9 ms
+        a control step in world coordinates, 2.1-2.9 about its centroid
+        (``p3_rawsheet.py``). A shell has no recentering component -- the engine
+        reports ``use_recentering`` off and refuses to set it ("CRecenteringParams
+        component not found") -- so the root stays where it is built, and a pin
+        (:meth:`pin_nodes`) still takes its target in the world: 0.07 mm from it
+        at an identity root and at a centroid one alike (``p1_facts.py``).
+
+        **Contact** is the params' through :func:`_contact_params`: ``friction``
+        (a cloth's ``ClothMaterialSpec.friction``), ``friction_falloff`` and the
+        rest of that set, each unstated one at the engine's own (mu 0.5, 10 mm/s,
+        a 1e9 penalty, no padding: what a shell is built with when nothing is
+        said). The engine meets two surfaces at the geometric mean of their
+        coefficients -- a 0.1 m sheet on a 20 degree slope crept 11.6 mm in 2 s
+        at 0.2 on 1.0 and 11.7 mm at 0.447 on 0.447, 6.4 mm at 0.5 on 1.0 and at
+        0.707 on 0.707 (``p5_slope.py``) -- so a towel at the fabric default of
+        0.2, which this builder used to hand the engine as 0.5, meets the bench
+        (1.0) at 0.45 where it met it at 0.71: what VBD's
+        ``sqrt(soft_contact_mu * shape_material_mu)`` gives the same towel.
+        **Damping** -- ``mass_damping`` [1/s], ``stiffness_damping`` [s] -- is
+        set when stated and left at the engine's zeros otherwise.
+
+        Args:
+            record: The recipe's actor record.
+            defaults: Params a kind's own builder supplies under the record's,
+                which win over them: the bag's canvas (``robosimstudio_materials.bag``).
         """
         physics = self.physics
-        del particle_q  # the shared reader takes it off the model
         geom = actor_geometry(self.model, {**record, "kind": "shell"})
-        start, count, params, rest, tris = geom.start, geom.count, geom.params, geom.rest, geom.tris
+        start, count, rest, tris = geom.start, geom.count, geom.rest, geom.tris
+        params = {**(defaults or {}), **geom.params}
 
         thickness = float(params.get("thickness", 0.002))
         areal_density = float(params.get("areal_density", 0.3))
@@ -727,33 +806,51 @@ class SuperdexBridge:
             areal_density / max(thickness, 1.0e-5),
             thickness,
         )
+        for key, attr in (
+            ("mass_damping", "mass_damping_coefficient"),
+            ("stiffness_damping", "stiffness_damping_coefficient"),
+        ):
+            if params.get(key) is not None:
+                setattr(material, attr, float(params[key]))
+        centre = rest.mean(axis=0)
         shape = physics.create_tri_mesh_shape(
-            coordinates=rest.ravel(),
+            coordinates=(rest - centre).ravel(),
             connectivity=tris.astype(np.int32).ravel(),
         )
         shell_params = physics.experimental.ShellActorParams(
             name=str(record.get("name", f"shell:{start}")),
             shape=shape,
             material=material,
-            world_from_local=self.actor_root(record),
+            world_from_local=physics.TransformRT(
+                rotation=physics.Quaternion(0.0, 0.0, 0.0, 1.0), translation=[float(v) for v in centre]
+            ),
         )
         shell_params.point_cloud_collider.radius = float(params.get("particle_radius", 0.002))
         shell_params.point_cloud_collider.self_contact = bool(params.get("self_contact", False))
+        engine = shell_params.contact  # what an unstated key keeps
+        shell_params.contact = _contact_params(
+            physics,
+            params,
+            penalty=float(engine.penalty_coefficient),
+            friction=float(engine.coulomb_friction_coefficient),
+            padding=float(engine.penalty_threshold_extra_padding),
+        )
         actor = physics.experimental.create_shell_actor(self.scene_of(record.get("world", 0)), shell_params)
-        try:
-            actor.set_recentering_params(physics.RecenteringParams(use_recentering=False))
-        except (physics.Error, RuntimeError):
-            pass  # a shell that recenters differently still reads back through its root transform
         actor.register_query(physics.QueryType.NODE_POSITIONS)
         np_real = np.float64 if physics.uses_double_precision() else np.float32
         return {
             "name": str(record.get("name", "")),
             "actor": actor,
-            "read": actor.get_node_positions_local,
+            "read": _root_reader(actor),
             "start": start,
             "count": count,
             "prev": rest.astype(np_real).copy(),
         }
+
+    def _build_shell_actor(self, record: dict, particle_q: np.ndarray, tet_indices=None, tet_materials=None) -> dict:
+        """A cloth's membrane: :meth:`build_shell` with nothing under the record's params."""
+        del particle_q, tet_indices, tet_materials  # the shared reader takes them off the model
+        return self.build_shell(record)
 
     def _build_soft_actor(
         self, record: dict, particle_q: np.ndarray, tet_indices: np.ndarray = None, tet_materials: np.ndarray = None
@@ -1066,11 +1163,12 @@ class SuperdexBridge:
 
         for entry in self.actors:
             # Through the entry's own reader rather than one call for every
-            # kind: a soft or shell actor answers ``get_node_positions_local``,
-            # and not every actor type does -- the engine refuses NodePositions
-            # for some and states them as a rest mesh plus a per-node
-            # displacement instead. The tick has no business knowing which; the
-            # builder that made the actor does.
+            # kind: a soft actor's local nodes are world, a shell's are about
+            # its centroid and come through its root, and not every actor type
+            # answers ``get_node_positions_local`` at all -- the engine refuses
+            # NodePositions for some and states them as a rest mesh plus a
+            # per-node displacement instead. The tick has no business knowing
+            # which; the builder that made the actor does.
             entry["prev"] = self.rig.write_particles(
                 state, entry["start"], entry["count"], np.asarray(entry["read"]()), dt, entry["prev"]
             )
@@ -1294,7 +1392,9 @@ class SuperdexBridge:
             entity_name: Which actor's nodes (the entity's name).
             nodes: Global model particle indices, as the callers already hold.
             targets: World positions ``[n, 3]``, in Newton's frame, which is
-                also every scene's frame.
+                also every scene's frame. Whatever the actor's root: the engine
+                takes a node constraint's target in the world, so a sheet built
+                about its centroid is pinned as a sponge at identity is.
             world: Which world's actor. 0 when nothing replicated it.
         """
         entry = next(
@@ -1305,13 +1405,17 @@ class SuperdexBridge:
         handle_fn = getattr(actor, "get_handle", None)
         handle = handle_fn() if callable(handle_fn) else actor
         constraints = []
+        # A builder whose actor has fewer nodes than particles states ``nodes``: a
+        # closed rod's last particle is its seam, node 0 drawn again.
+        wrap = int(entry["nodes"]) if "nodes" in entry else None
         for node, target in zip(np.asarray(nodes, dtype=np.int64), np.asarray(targets, dtype=np.float64), strict=True):
+            local = int(node - entry["start"])
             constraints.append(
                 scene.create_deformable_node_position_constraint(
                     stiffness=float(stiffness),
                     damping=float(damping),
                     saturation=-1.0,
-                    node_index=int(node - entry["start"]),
+                    node_index=local % wrap if wrap else local,
                     position=[float(v) for v in target],
                     actor=handle,
                 )
@@ -1382,14 +1486,20 @@ class SuperdexBridge:
         one.
 
         ``positions`` is this actor's nodes in the Newton world frame, in the
-        order the model holds them. Local **is** world for every actor this
-        bridge builds -- recentering is off and the root is identity -- which is
-        the same assumption every read-back above already makes.
+        order the model holds them. They are written through the actor's own
+        root transform: identity for a soft body (recentering is off), so local
+        **is** world there, and the centroid for a sheet or a bag, which
+        :meth:`build_shell` solves about its own middle in float32 and reads
+        back through the root (:meth:`root_reader`).
 
         Velocities go to zero and ``prev`` is refreshed from what the engine
         reports back, because a teleport is not motion: the first speed reading
         after one must not be the jump. The mirrors are marked for teleport for
         the same reason ``restore_rest`` marks them.
+
+        A rod is refused by name, as a body on a rigid core is: the engine takes
+        node positions on a soft body or a shell only, and a rod's builder moves
+        its nodes once, as it is built, by holding them.
         """
         rows = np.asarray(positions, dtype=np.float64).reshape(-1, 3)
         touched: list[dict] = []
@@ -1397,13 +1507,20 @@ class SuperdexBridge:
         for entry in self.actors_by_world.get(int(world), ()):
             if entry.get("entity") != str(entity):
                 continue
+            if "skinned" not in entry and entry["actor"].get_type() == self.physics.ActorType.ROD:
+                # Asked anyway, the engine raises from inside ("CDisplacementSlice ... required"), open or closed.
+                raise NotImplementedError(
+                    f"{entity!r} is a rod: SuperDex sets the nodes of a soft body or a shell only, "
+                    "so a rod starts where its spec lays it"
+                )
             if len(rows) != int(entry["count"]):
                 raise ValueError(f"{entity!r} in world {world} has {entry['count']} nodes, given {len(rows)}")
             actor = entry["actor"]
             if "skinned" in entry:
                 # Its nodes are the skeleton's pose plus a deformation; a placement is a skeleton pose.
                 raise NotImplementedError(f"{entity!r} has a rigid core: place it by its skeleton, not its nodes")
-            actor.set_node_positions_local(rows.ravel())
+            rot, offset = _root_matrix(actor)  # local -> world, so world -> local is its inverse
+            actor.set_node_positions_local(((rows - offset) @ rot).ravel())
             actor.set_node_velocities_local(np.zeros(rows.size, dtype=np.float64))
             touched.append(entry)
             moved = True
@@ -1451,7 +1568,27 @@ class SuperdexBridge:
 _CONSUMES = {
     # What each builder above actually reads off ``HostActor.params``; the
     # composer warns on anything an actor states outside its kind's set.
-    "shell": ("areal_density", "particle_radius", "poisson", "self_contact", "thickness", "young"),
+    # ``welds`` is read by ``_build_welds``, which joins every kind's stated
+    # nodes alike: a weld stated on a sheet holds a second sheet hung off it
+    # at 0.000 mm after a second, which falls 4.9 m without it, and on a bag
+    # the same (``c1_shell_weld.py``; ``tests/test_superdex_sheet.py``).
+    "shell": (
+        "areal_density",
+        "contact_padding",
+        "contact_penalty",
+        "contact_smoothing",
+        "contact_threshold",
+        "friction",
+        "friction_falloff",
+        "mass_damping",
+        "particle_radius",
+        "poisson",
+        "self_contact",
+        "stiffness_damping",
+        "thickness",
+        "welds",
+        "young",
+    ),
     "tet": (
         "anchors",
         "boundary_samples",

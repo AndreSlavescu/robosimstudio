@@ -46,6 +46,7 @@ from robosimstudio.core.lifecycle import TaskSchedule, steps_of
 from robosimstudio.core.pipeline import ScenePipeline
 from robosimstudio.core.render.finish import Finish
 from robosimstudio.core.render.palette import FLOOR
+from robosimstudio.core.streams import quiet_gc
 from robosimstudio.core.worlds import WorldMap
 from robosimstudio.machine import Platform, announce, platform
 from robosimstudio.machine import apply as apply_platform
@@ -67,7 +68,7 @@ from .request import SceneRequest
 Composer = Callable[..., PhysicsProgram]
 """Builds the physics for a finalized model. See :func:`compile_scene`."""
 
-__all__ = ["CannotReplicate", "CompiledScene", "compile_scene", "resolve_regions"]
+__all__ = ["CannotReplicate", "CompiledScene", "compile_scene", "declared_domains", "resolve_regions"]
 
 
 class CannotReplicate(NotImplementedError):
@@ -234,6 +235,52 @@ def _make_entity(spec, arrangement=None, *, gripper_span: float = 0.08) -> Entit
     return cls(spec, **({"gripper_span": gripper_span} if takes_span else {}))
 
 
+def declared_domains(request: SceneRequest) -> set[str]:
+    """The domains the request's specs declare, by the rule ``resolve_entity_class`` reads them.
+
+    The spec's ``sim.domain`` when it carries one, else the registered entity
+    class's; a name nothing has registered is left to ``_make_entity``, whose
+    message names the kind. The robot is ``articulated`` whatever its spec
+    says, and ``"*"`` stands for whatever a domain falls through to.
+    """
+    out: set[str] = {"*"}
+    if request.embodiment:
+        out.add("articulated")
+    out.update(domain for spec in request.build_order() if (domain := _spec_domain(spec)[0]))
+    return out
+
+
+def _spec_domain(spec: Any) -> tuple[str, bool]:
+    """One spec's domain by :func:`declared_domains`' rule, and whether its own ``sim`` names a backend."""
+    from robosimstudio.specs.physics import SimRequirements
+
+    from .registry import ENTITIES
+
+    declared = getattr(spec, "sim", None)
+    if isinstance(declared, SimRequirements):
+        return declared.domain, declared.backend is not None
+    name = getattr(spec, "entity", "")
+    try:
+        cls = ENTITIES.get(name) if name else None
+    except KeyError:
+        cls = None
+    return str(getattr(cls, "domain", "") or ""), False
+
+
+def _owners(request: SceneRequest) -> dict[str, list[str]]:
+    """Kind -> the names of the request's entities of that kind whose own spec names no backend.
+
+    Empty for a request that cannot list its specs, which then has nothing to refuse here.
+    """
+    out: dict[str, list[str]] = {}
+    build_order = getattr(request, "build_order", None)
+    for spec in build_order() if callable(build_order) else ():
+        domain, named = _spec_domain(spec)
+        if domain and not named:
+            out.setdefault(domain, []).append(str(getattr(spec, "name", "") or ""))
+    return out
+
+
 def compile_scene(
     request: SceneRequest,
     episode: Episode | None = None,
@@ -306,7 +353,7 @@ def compile_scene(
     if not plat.cuda_graphs:
         use_cuda_graph = False
 
-    with wp.ScopedDevice(plat.device):
+    with quiet_gc(), wp.ScopedDevice(plat.device):
         if num_worlds == 1:
             scene = _compile(
                 request,
@@ -351,22 +398,32 @@ def _on_the_host(program: PhysicsProgram | None, plat: Platform) -> tuple[str, .
 def _for_platform(request: SceneRequest, plat: Platform, num_worlds: int) -> tuple[SceneRequest, tuple[str, ...]]:
     """The request as it builds on ``plat``, and what changed -- or a refusal naming what cannot.
 
-    The identity on a GPU. On a CPU: the arrangement is adapted by
+    On a GPU, the identity, or a refusal naming each kind the arrangement puts
+    on a backend that steps it on no device, with the route that does
+    (:func:`~robosimstudio.scene.physics.devices.misrouted`). On a CPU: the
+    arrangement is adapted by
     :func:`~robosimstudio.scene.physics.devices.arrangement_for` *before* any
     entity is built, because the arrangement picks entity classes as well as
-    solvers; a scene asking for what a CPU cannot do -- several worlds of a
-    one-world solver, signed-distance fields -- is refused here, by name,
-    rather than inside the solver's importer.
+    solvers; a scene asking for what a CPU cannot do -- a kind nothing on a CPU
+    steps (:func:`~robosimstudio.scene.physics.devices.unserved`), several
+    worlds of a one-world solver, signed-distance fields -- is refused here, by
+    name, rather than inside the composer or the solver's importer.
     """
+    from .physics import CompositionError
+    from .physics.devices import device_facts, misrouted, unserved
+
+    physics = request.physics
     if not plat.is_cpu:
+        refused = misrouted(physics, _owners(request))
+        if refused:
+            raise CompositionError(" ".join(refused))
         return request, ()
     import dataclasses
     import importlib.util
 
-    from .physics import CompositionError
-    from .physics.devices import device_facts
-
-    physics = request.physics
+    refused = unserved(physics, _owners(request))
+    if refused:
+        raise CompositionError(f"this scene is on a CPU. {' '.join(refused)}")
     adapted, notes = arrangement_for(physics, is_cpu=True)
     if num_worlds > 1:
         for _, spec in adapted.backends:
@@ -399,7 +456,7 @@ def _for_platform(request: SceneRequest, plat: Platform, num_worlds: int) -> tup
     if hosted and missing:
         notes = (
             *notes,
-            "SuperDex is not installed, so a cloth, rope or soft body will not build: pip install 'robosimstudio[cpu]'",
+            "SuperDex is not installed, so a cloth, bag, rope or soft body will not build: pip install 'robosimstudio[cpu]'",
         )
     return request, tuple(notes)
 
@@ -552,7 +609,9 @@ def _build_base(
     collision = arrangement.collision
     builder = newton.ModelBuilder()
     if arrangement.gravity != -9.81:
-        builder.gravity = float(arrangement.gravity)
+        # A vector along the builder's up axis: Newton 1.7 refuses a scalar
+        # (1.6 took one as a magnitude along up_vector, which this reproduces).
+        builder.gravity = tuple(float(arrangement.gravity) * float(c) for c in builder.up_vector)
     if collision.rigid_gap is not None:
         # Before anything imports: this is the default gap for every shape that
         # states none, and a tight-clearance task needs it at the scale of its
@@ -577,7 +636,7 @@ def _build_base(
     # before any entity builds -- MuJoCo's gravcomp, VBD's per-joint flags. Done
     # here, from the arrangement, so no entity has to import a solver to know
     # which attributes its builder calls will be allowed to keep.
-    register_custom_attributes(builder, arrangement)
+    register_custom_attributes(builder, arrangement, domains=declared_domains(request))
 
     entities: list[Entity] = []
     embodiment: Entity | None = None
@@ -649,13 +708,22 @@ def _build_base(
             # A hand named by the pairing replaces every arm's. It has to clear
             # the per-arm names as well as set the robot's, because an arm's own
             # entry wins over the robot's default -- leaving them would put the
-            # requested hand on nothing and read as the flag being ignored.
+            # requested hand on nothing and read as the flag being ignored. And
+            # the arm's mount with its name: it says where *that* hand bolts on
+            # and wins over a hand's own, so left behind it would bolt the new
+            # hand where the old one sat (a cup 105 mm out on the YAM's wrist).
+            # An arm that already carries the named hand keeps its entry, mount
+            # and all: that mount is where this very hand bolts on.
             from dataclasses import replace as _replace
 
+            own = embodiment_spec.gripper
             embodiment_spec = _replace(
                 embodiment_spec,
                 gripper=binding.gripper,
-                arms=tuple(_replace(a, gripper="") for a in embodiment_spec.arms),
+                arms=tuple(
+                    a if (a.gripper or own) == binding.gripper else _replace(a, gripper="", gripper_mount=None)
+                    for a in embodiment_spec.arms
+                ),
             )
         arm_gains = binding.arm_actuation or request.arm_actuation
         gripper_gains = binding.gripper_actuation or request.gripper_actuation
@@ -741,6 +809,14 @@ def _build_base(
             entity.replicated = True
         entity.build_into(builder, episode)
         entities.append(entity)
+
+    # --- 4. what the robot needs the whole scene for ----------------------
+    # A vacuum cup couples to the parts it may hold with weld rows the builder
+    # has to carry before it finalizes, and the parts build after the robot
+    # (step 3), so the robot's own after_build is too early to name them.
+    after_scene_built = getattr(embodiment, "after_scene_built", None)
+    if callable(after_scene_built):
+        after_scene_built(builder, entities)
 
     # --- 5. finalize ------------------------------------------------------
     # Scene-wide, and after every entity has built: a texture bound by one
@@ -960,6 +1036,24 @@ def _finish(
     return scene
 
 
+def _finalize(builder: newton.ModelBuilder) -> newton.Model:
+    """``builder.finalize()``, its ``joint_dof_dim`` two-dimensional when the model has no joint.
+
+    Newton 1.7 builds it as ``wp.array(np.array([]), ndim=2)``, which warp makes a
+    one-dimensional empty array, and VBD's ``reset`` hands it to ``reset_rigid_state``
+    whenever the model has a body to integrate. A body with no joint (a bare ``add_link``)
+    beside a sheet with no robot failed at the first reset -- "argument 'joint_dof_dim'
+    expects an array with 2 dimension(s)" -- with the sheet on VBD or on SuperDex alike, and
+    a free box (a FREE joint) built (``c5b_joints.py``). A static box was such a body until
+    it was welded to the world (``robosimstudio.domains.static.welded.weld_to_world``); any
+    other model with a body and no joint still meets it here.
+    """
+    model = builder.finalize()
+    if model.joint_dof_dim is not None and model.joint_dof_dim.ndim != 2 and not model.joint_count:
+        model.joint_dof_dim = wp.zeros((0, 2), dtype=wp.int32, device=model.device)
+    return model
+
+
 def _compile(
     request: SceneRequest,
     episode: Episode,
@@ -971,7 +1065,7 @@ def _compile(
 ) -> CompiledScene:
     """One world: build it, finalize it, bind to it, step it."""
     base = _build_base(request, episode)
-    model = base.builder.finalize()
+    model = _finalize(base.builder)
 
     lifecycle = _lifecycle(base.entities)
     for step in lifecycle.steps("bind"):
@@ -1024,12 +1118,27 @@ def _run_ready(pipeline, lifecycle) -> None:
             capture()
 
 
+def _adds_substep_kernels(entity: Any) -> bool:
+    """Whether ``entity`` puts kernels in the substep block.
+
+    Its class overriding ``contribute_hooks`` is what says so, unless the
+    instance answers ``adds_substep_kernels = False``: a class whose kernels
+    belong to only some of its instances says which ones. A robot is that case,
+    because only a vacuum cup's wrench is a kernel, and a robot with jaws must
+    replicate as it did before cups existed.
+    """
+    if type(entity).contribute_hooks is Entity.contribute_hooks:
+        return False
+    return bool(getattr(entity, "adds_substep_kernels", True))
+
+
 def _replication_refusal(base: _BaseBuild, request: SceneRequest) -> str:
     """Why this scene must not be replicated yet, or empty when it may be.
 
     Refusing by *capability* rather than by a list of task names, and the
     capability is narrow: an entity that contributes **substep kernels** with
-    world-0 particle and body indices baked into them. Replicated, every world's
+    world-0 particle and body indices baked into them (its ``contribute_hooks``,
+    as :func:`_adds_substep_kernels` reads it). Replicated, every world's
     physics would run against world 0's arrays -- plausible motion in the wrong
     place, which is the failure worth refusing where it can still be named. An
     entity whose kernels are written per world says so with
@@ -1045,7 +1154,7 @@ def _replication_refusal(base: _BaseBuild, request: SceneRequest) -> str:
     contributors = sorted(
         entity.name
         for entity in base.entities
-        if type(entity).contribute_hooks is not Entity.contribute_hooks and not getattr(entity, "world_aware", False)
+        if _adds_substep_kernels(entity) and not getattr(entity, "world_aware", False)
     )
     if contributors:
         return f"these entities contribute substep physics written for one world: {', '.join(contributors)}"
@@ -1167,8 +1276,8 @@ def _compile_multi(
     fleet.gravity = base.builder.gravity
     fleet.replicate(base.builder, num_worlds, spacing=(0.0, 0.0, 0.0))
 
-    template_model = base.builder.finalize()
-    model = fleet.finalize()
+    template_model = _finalize(base.builder)
+    model = _finalize(fleet)
     worlds = WorldMap.of(template_model, model, num_worlds)
 
     # Before ``bind``, because ``bind`` is where an entity allocates its device
