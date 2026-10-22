@@ -9,8 +9,10 @@ box is one narrow line and truncates, and these are the two readouts the page
 is for -- what is loaded and when, and the traceback when a rebuild did not
 land. Whether a rebuild lands running or paused is the server's ``hold``; the
 Pause checkbox on the page is the human's override either way, and the
-studio's own ``set_paused`` keeps the two truthful. While a routine plays the
-page's own stepping is held regardless (:meth:`LiveSession.steps_held`), and
+studio's own ``set_paused`` keeps the two truthful. While a routine that steps
+the scene itself plays, the page's own stepping is held regardless
+(:meth:`LiveSession.steps_held`); one that only yields is stepped by the page,
+paused or not (:meth:`LiveSession.steps_forced`). And
 both Reset buttons -- this folder's and the Simulation folder's -- go through
 the one :meth:`LiveSession.reset_now`.
 """
@@ -46,8 +48,12 @@ class LiveSession(StudioSession):
         super().adopt(sim, label=label, episode=episode)
 
     def steps_held(self) -> bool:
-        """While a routine plays it steps the scene itself; the studio's own step would double it."""
-        return bool(self.host.script)
+        """While a routine plays that the page does not step this pass, the studio's own step would double it."""
+        return bool(self.host.script) and not self.host.page_steps_script()
+
+    def steps_forced(self) -> bool:
+        """A routine the page steps is stepped whatever Pause says (a reset ends it, and the page stays paused)."""
+        return self.host.page_steps_script()
 
     def reset_now(self) -> bool:
         """A reset ends whatever routine is playing and the take filming it, then resets."""

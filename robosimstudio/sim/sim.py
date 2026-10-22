@@ -103,6 +103,8 @@ class Sim(EnvBase):
             it -- it has no episodes to index -- and ``Env`` reassigns it per
             reset. Read by :meth:`reset_scene`, which hands it to each entity's
             own ``reset``."""
+        self.reset_count = 0
+        """Resets since the build: a reader that sampled ``step_count`` before tells a reset from a pause by it."""
         self._start_joint_q: np.ndarray | None = None
         """The articulation this run started from. Captured rather than compiled,
         because the warm-up steps real physics between the compiled pose and the
@@ -746,6 +748,9 @@ class Sim(EnvBase):
         then calls this.
         """
         obs, info = super().reset()
+        # counted, so a reader that sampled step_count before can tell a reset from a pause, however many
+        # steps followed it (the live page's takes and routines count their steps across one)
+        self.reset_count += 1
         self._warned_nonfinite = False  # the finite flags were just cleared too
         if self._start_joint_q is None and self.model.joint_count:
             # After the base class has warmed up *and* re-posed, so this is the
