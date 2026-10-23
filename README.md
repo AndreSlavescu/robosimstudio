@@ -12,7 +12,7 @@ robot manipulation tasks in simulation, by hand or with a coding agent.
 ---
 ### News
 - **[2026/10/21]** 🔥 We have released many-demo collection with physics on the CPU and GL rendering: 500 demos in 4.2 min on one GPU. 
-- **[2026/10/20]** 🔥 We have added fifteen kinds of material, among them rope, knots, paper, bags, brushes, tape, cutting, granular, liquid, dough and water, each with a robot example at [**Materials**](examples/03_materials).
+- **[2026/10/20]** 🔥 We have added fifteen kinds of material, among them rope, knots, paper, bags, brushes, tape, cutting, granular, liquid, dough and water, each with an example at [**Materials**](examples/).
 - **[2026/10/18]** 🔥 RoboSimStudio runs on CPU-only machines. Get started [**Here**](examples/install.md).
 - **[2026/10/14]** 🔥 RoboSimStudio has been released!
 
@@ -33,16 +33,16 @@ based on the video at [Your Video Path].
 
 ## Acknowledgements
 
-RoboSimStudio is built on [Newton](https://github.com/newton-physics/newton),
-[Warp](https://github.com/NVIDIA/warp) and
-[MuJoCo Warp](https://github.com/google-deepmind/mujoco_warp), and its studio
-on [viser](https://github.com/viser-project/viser). It draws on
+RoboSimStudio is hugely inspired and built on [Newton](https://github.com/newton-physics/newton),
+[Warp](https://github.com/NVIDIA/warp),
+[MuJoCo Warp](https://github.com/google-deepmind/mujoco_warp),
+[SuperDex](https://github.com/facebookresearch/project_superdex).
+[viser](https://github.com/viser-project/viser), 
 [Isaac Lab](https://github.com/isaac-sim/IsaacLab),
 [Isaac Lab Arena](https://github.com/isaac-sim/IsaacLab-Arena),
 [PyRoKi](https://github.com/chungmin99/pyroki),
-[Genesis](https://github.com/Genesis-Embodied-AI/Genesis),
-[SuperDex](https://github.com/facebookresearch/project_superdex) and
-[LeRobot](https://github.com/huggingface/lerobot). Robot models come from
+[Genesis](https://github.com/Genesis-Embodied-AI/Genesis).
+Robot models come from
 [i2rt](https://github.com/i2rt-robotics/i2rt) and
 [robosuite](https://github.com/ARISE-Initiative/robosuite); see `NOTICE`.
 Thanks to their authors.
